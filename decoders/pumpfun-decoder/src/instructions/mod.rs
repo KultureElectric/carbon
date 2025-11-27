@@ -12,6 +12,7 @@ pub mod admin_set_idl_authority_event;
 pub mod admin_update_token_incentives;
 pub mod admin_update_token_incentives_event;
 pub mod buy;
+pub mod buy_exact_sol_in;
 pub mod claim_token_incentives;
 pub mod claim_token_incentives_event;
 pub mod close_user_volume_accumulator;
@@ -22,6 +23,7 @@ pub mod complete_event;
 pub mod complete_pump_amm_migration_event;
 pub mod create;
 pub mod create_event;
+pub mod create_v2;
 pub mod extend_account;
 pub mod extend_account_event;
 pub mod init_user_volume_accumulator;
@@ -60,6 +62,7 @@ pub enum PumpfunInstruction {
     CloseUserVolumeAccumulator(close_user_volume_accumulator::CloseUserVolumeAccumulator),
     CollectCreatorFee(collect_creator_fee::CollectCreatorFee),
     Create(create::Create),
+    CreateV2(create_v2::CreateV2),
     ExtendAccount(extend_account::ExtendAccount),
     InitUserVolumeAccumulator(init_user_volume_accumulator::InitUserVolumeAccumulator),
     Initialize(initialize::Initialize),
@@ -130,6 +133,7 @@ impl carbon_core::instruction::InstructionDecoder<'_> for PumpfunDecoder {
             PumpfunInstruction::CloseUserVolumeAccumulator => close_user_volume_accumulator::CloseUserVolumeAccumulator,
             PumpfunInstruction::CollectCreatorFee => collect_creator_fee::CollectCreatorFee,
             PumpfunInstruction::Create => create::Create,
+            PumpfunInstruction::CreateV2 => create_v2::CreateV2,
             PumpfunInstruction::ExtendAccount => extend_account::ExtendAccount,
             PumpfunInstruction::InitUserVolumeAccumulator => init_user_volume_accumulator::InitUserVolumeAccumulator,
             PumpfunInstruction::Initialize => initialize::Initialize,

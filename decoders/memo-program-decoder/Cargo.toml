@@ -1,6 +1,6 @@
 [package]
 name = "carbon-memo-program-decoder"
-version = "0.10.0"
+version = "0.12.0"
 description = "Memo Program Decoder"
 license = { workspace = true }
 edition = { workspace = true }
@@ -16,4 +16,4 @@ crate-type = ["rlib"]
 carbon-core = { workspace = true }
 serde = { workspace = true }
 solana-instruction = { workspace = true, default-features = false }
-spl-memo = { workspace = true }
+spl-memo-interface = { workspace = true }
