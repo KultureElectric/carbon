@@ -114,6 +114,16 @@ impl Datasource for JitoShredstreamGrpcClient {
                             let _ = dedup_cache.put(entry.hash, ());
 
                             for transaction in entry.transactions {
+                                // Skip malformed transactions with no signatures
+                                // (get_signature() panics on empty signatures array)
+                                if transaction.signatures.is_empty() {
+                                    log::warn!(
+                                        "Skipping transaction with no signatures at slot {}",
+                                        message.slot
+                                    );
+                                    continue;
+                                }
+
                                 let signature = *transaction.get_signature();
 
                                 let update = Update::Transaction(Box::new(TransactionUpdate {
