@@ -198,12 +198,18 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
             let id_for_loop = id.clone();
 
-            // Inter-arrival timing tracking for account updates
+            // Inter-arrival timing tracking for account updates (global)
             let mut last_account_arrival: Option<std::time::Instant> = None;
             let mut arrival_count: u64 = 0;
             let mut total_delta_us: u64 = 0;
             let mut min_delta_us: u64 = u64::MAX;
             let mut max_delta_us: u64 = 0;
+
+            // Intra-slot timing tracking (per-slot metrics)
+            let mut current_slot: Option<u64> = None;
+            let mut slot_first_arrival: Option<std::time::Instant> = None;
+            let mut slot_last_arrival: Option<std::time::Instant> = None;
+            let mut slot_update_count: u64 = 0;
 
             loop {
                 tokio::select! {
@@ -233,14 +239,69 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                     match message {
                                         Ok(msg) => match msg.update_oneof {
                                             Some(UpdateOneof::Account(account_update)) => {
-                                                // Track inter-arrival timing for account updates via histogram
+                                                let update_slot = account_update.slot;
+
+                                                // Check if slot changed - emit metrics for previous slot
+                                                if let Some(prev_slot) = current_slot {
+                                                    if update_slot != prev_slot {
+                                                        // Emit slot span metric (first to last arrival time)
+                                                        if let (Some(first), Some(last)) = (slot_first_arrival, slot_last_arrival) {
+                                                            let span_us = last.duration_since(first).as_micros() as u64;
+                                                            let _ = metrics.record_histogram(
+                                                                "yellowstone_grpc_slot_span_us",
+                                                                span_us as f64,
+                                                            ).await;
+                                                        }
+                                                        // Emit slot update count
+                                                        let _ = metrics.record_histogram(
+                                                            "yellowstone_grpc_slot_update_count",
+                                                            slot_update_count as f64,
+                                                        ).await;
+
+                                                        // Log slot transition with timing info
+                                                        if slot_update_count > 0 {
+                                                            if let (Some(first), Some(last)) = (slot_first_arrival, slot_last_arrival) {
+                                                                let span_us = last.duration_since(first).as_micros() as u64;
+                                                                log::debug!(
+                                                                    "Slot {} complete: {} updates, span={}us",
+                                                                    prev_slot, slot_update_count, span_us
+                                                                );
+                                                            }
+                                                        }
+
+                                                        // Reset for new slot
+                                                        slot_first_arrival = Some(arrival_time);
+                                                        slot_last_arrival = Some(arrival_time);
+                                                        slot_update_count = 1;
+                                                        current_slot = Some(update_slot);
+                                                    } else {
+                                                        // Same slot - track intra-slot inter-arrival
+                                                        if let Some(last_slot_arrival) = slot_last_arrival {
+                                                            let intra_delta_us = arrival_time.duration_since(last_slot_arrival).as_micros() as u64;
+                                                            let _ = metrics.record_histogram(
+                                                                "yellowstone_grpc_intra_slot_interarrival_us",
+                                                                intra_delta_us as f64,
+                                                            ).await;
+                                                        }
+                                                        slot_last_arrival = Some(arrival_time);
+                                                        slot_update_count += 1;
+                                                    }
+                                                } else {
+                                                    // First update ever
+                                                    current_slot = Some(update_slot);
+                                                    slot_first_arrival = Some(arrival_time);
+                                                    slot_last_arrival = Some(arrival_time);
+                                                    slot_update_count = 1;
+                                                }
+
+                                                // Track global inter-arrival timing for account updates via histogram
                                                 if let Some(last_arrival) = last_account_arrival {
                                                     let delta_us = arrival_time.duration_since(last_arrival).as_micros() as u64;
                                                     total_delta_us += delta_us;
                                                     min_delta_us = min_delta_us.min(delta_us);
                                                     max_delta_us = max_delta_us.max(delta_us);
 
-                                                    // Record inter-arrival delta as histogram metric
+                                                    // Record global inter-arrival delta as histogram metric
                                                     let _ = metrics.record_histogram(
                                                         "yellowstone_grpc_account_interarrival_us",
                                                         delta_us as f64,
@@ -253,8 +314,8 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                 if arrival_count > 1 && arrival_count % 5000 == 0 {
                                                     let avg_delta_us = total_delta_us / (arrival_count - 1);
                                                     log::info!(
-                                                        "📊 Account arrival stats (slot {}): count={}, avg_delta={}us, min={}us, max={}us",
-                                                        account_update.slot, arrival_count, avg_delta_us, min_delta_us, max_delta_us
+                                                        "Account arrival stats (slot {}): count={}, avg_delta={}us, min={}us, max={}us",
+                                                        update_slot, arrival_count, avg_delta_us, min_delta_us, max_delta_us
                                                     );
                                                 }
 
