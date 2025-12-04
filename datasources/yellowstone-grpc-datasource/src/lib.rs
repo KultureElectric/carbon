@@ -198,16 +198,34 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
             let id_for_loop = id.clone();
 
+            // Inter-arrival timing tracking for account updates
+            let mut last_account_arrival: Option<std::time::Instant> = None;
+            let mut arrival_count: u64 = 0;
+            let mut total_delta_us: u64 = 0;
+            let mut min_delta_us: u64 = u64::MAX;
+            let mut max_delta_us: u64 = 0;
+
             loop {
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         log::info!("Cancelling Yellowstone gRPC subscription.");
+                        // Log final arrival stats
+                        if arrival_count > 1 {
+                            let avg_delta_us = total_delta_us / (arrival_count - 1);
+                            log::info!(
+                                "Account arrival stats: count={}, avg_delta={}us, min={}us, max={}us",
+                                arrival_count, avg_delta_us, min_delta_us, max_delta_us
+                            );
+                        }
                         break;
                     }
                     result = geyser_client.subscribe_with_request(Some(subscribe_request.clone())) => {
                         match result {
                             Ok((mut subscribe_tx, mut stream)) => {
                                 while let Some(message) = stream.next().await {
+                                    // CRITICAL: Record arrival time IMMEDIATELY when message is received
+                                    let arrival_time = std::time::Instant::now();
+
                                     if cancellation_token.is_cancelled() {
                                         break;
                                     }
@@ -215,6 +233,31 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                     match message {
                                         Ok(msg) => match msg.update_oneof {
                                             Some(UpdateOneof::Account(account_update)) => {
+                                                // Track inter-arrival timing for account updates via histogram
+                                                if let Some(last_arrival) = last_account_arrival {
+                                                    let delta_us = arrival_time.duration_since(last_arrival).as_micros() as u64;
+                                                    total_delta_us += delta_us;
+                                                    min_delta_us = min_delta_us.min(delta_us);
+                                                    max_delta_us = max_delta_us.max(delta_us);
+
+                                                    // Record inter-arrival delta as histogram metric
+                                                    let _ = metrics.record_histogram(
+                                                        "yellowstone_grpc_account_interarrival_us",
+                                                        delta_us as f64,
+                                                    ).await;
+                                                }
+                                                last_account_arrival = Some(arrival_time);
+                                                arrival_count += 1;
+
+                                                // Log stats every 5000 account updates for debugging
+                                                if arrival_count > 1 && arrival_count % 5000 == 0 {
+                                                    let avg_delta_us = total_delta_us / (arrival_count - 1);
+                                                    log::info!(
+                                                        "📊 Account arrival stats (slot {}): count={}, avg_delta={}us, min={}us, max={}us",
+                                                        account_update.slot, arrival_count, avg_delta_us, min_delta_us, max_delta_us
+                                                    );
+                                                }
+
                                                 send_subscribe_account_update_info(
                                                     account_update.account,
                                                     &metrics,
