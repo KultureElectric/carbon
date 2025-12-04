@@ -521,6 +521,7 @@ impl Pipeline {
                     slot: account_update.slot,
                     pubkey: account_update.pubkey,
                     transaction_signature: account_update.transaction_signature,
+                    write_version: account_update.write_version,
                 };
 
                 for pipe in self.account_pipes.iter_mut() {

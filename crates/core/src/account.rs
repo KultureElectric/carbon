@@ -72,11 +72,13 @@ use {
 /// - `slot`: The Solana slot number where the account was updated.
 /// - `pubkey`: The public key of the account.
 /// - `transaction_signature`: Signature of the transaction that caused the update.
+/// - `write_version`: Monotonically increasing version number for ordering updates within a slot.
 #[derive(Debug, Clone)]
 pub struct AccountMetadata {
     pub slot: u64,
     pub pubkey: Pubkey,
     pub transaction_signature: Option<Signature>,
+    pub write_version: Option<u64>,
 }
 
 /// Represents the decoded data of a Solana account, including account-specific
