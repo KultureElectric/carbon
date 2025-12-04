@@ -344,6 +344,7 @@ impl Datasource for GpaRpcDatasource {
                         account,
                         slot,
                         transaction_signature: None,
+                        write_version: None,
                     }),
                     id_for_loop.clone(),
                 )) {

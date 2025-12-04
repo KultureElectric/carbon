@@ -336,6 +336,7 @@ impl Datasource for HeliusWebsocket {
                                                         account: decoded_account,
                                                         slot: acc_event.context.slot,
                                                         transaction_signature: None,
+                                                        write_version: None,
                                                     });
 
                                                     metrics.record_histogram("helius_atlas_ws_account_process_time_nanoseconds", start_time.elapsed().as_nanos() as f64).await.unwrap_or_else(|value| log::error!("Error recording metric: {value}"));

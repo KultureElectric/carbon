@@ -236,12 +236,14 @@ pub enum UpdateType {
 /// - `account`: The new state of the account.
 /// - `slot`: The slot number in which this account update was recorded.
 /// - `transaction_signature`: Signature of the transaction that caused the update.
+/// - `write_version`: Monotonically increasing counter for ordering updates within a slot.
 #[derive(Debug, Clone)]
 pub struct AccountUpdate {
     pub pubkey: Pubkey,
     pub account: Account,
     pub slot: u64,
     pub transaction_signature: Option<Signature>,
+    pub write_version: Option<u64>,
 }
 
 /// Represents the details of a Solana block, including its slot, hashes, rewards, and timing information.
