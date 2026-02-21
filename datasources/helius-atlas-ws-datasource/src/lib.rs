@@ -383,6 +383,7 @@ impl Datasource for HeliusWebsocket {
                                                     account: decoded_account,
                                                     slot: acc_event.context.slot,
                                                     transaction_signature: None,
+                                                    write_version: None,
                                                 }
                                                 .into_update();
 

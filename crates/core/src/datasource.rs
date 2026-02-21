@@ -115,6 +115,7 @@ pub struct AccountUpdate {
     pub account: Account,
     pub slot: u64,
     pub transaction_signature: Option<Signature>,
+    pub write_version: Option<u64>,
 }
 
 impl AccountUpdate {
@@ -125,6 +126,7 @@ impl AccountUpdate {
             account,
             slot,
             transaction_signature,
+            write_version,
         } = self;
 
         if account.lamports == 0 {
@@ -133,6 +135,7 @@ impl AccountUpdate {
                 account,
                 slot,
                 transaction_signature,
+                write_version,
             })
         } else {
             Update::Account(Self {
@@ -201,6 +204,7 @@ mod tests {
             account,
             slot: 7,
             transaction_signature,
+            write_version: Some(11),
         }
         .into_update();
 
@@ -224,6 +228,7 @@ mod tests {
             },
             slot: 7,
             transaction_signature: None,
+            write_version: None,
         }
         .into_update();
 
