@@ -115,6 +115,7 @@ pub struct AccountUpdate {
     pub account: Account,
     pub slot: u64,
     pub transaction_signature: Option<Signature>,
+    pub write_version: Option<u64>,
 }
 
 /// Full transaction payload with execution metadata.

@@ -162,6 +162,7 @@ impl Datasource for RpcProgramSubscribe {
                                     account: decoded_account,
                                     slot: acc_event.context.slot,
                                     transaction_signature: None,
+                                    write_version: None,
                                 });
 
                                 ACCOUNT_PROCESS_TIME_NANOS.record(start_time.elapsed().as_nanos() as f64);
