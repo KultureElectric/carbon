@@ -14,7 +14,13 @@ use {
     solana_account::Account,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
-    std::{collections::HashMap, convert::TryFrom, sync::LazyLock, time::Duration},
+    std::{
+        collections::HashMap,
+        convert::TryFrom,
+        env,
+        sync::LazyLock,
+        time::Duration,
+    },
     tokio::sync::{mpsc, mpsc::Sender},
     tokio_util::sync::CancellationToken,
     yellowstone_grpc_client::{
@@ -27,6 +33,7 @@ use {
             SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdateAccountInfo,
             SubscribeUpdateTransactionInfo,
         },
+        prost::Message,
         tonic::{codec::CompressionEncoding, transport::ClientTlsConfig},
     },
 };
@@ -88,6 +95,36 @@ static TRANSACTION_UPDATES_RECEIVED: Counter = Counter::new(
     "yellowstone_grpc_transaction_updates_received_total",
     "Total transaction updates received from Yellowstone gRPC",
 );
+static ACCOUNT_INTERARRIVAL_US: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::new(
+        "yellowstone_grpc_account_interarrival_us",
+        "Inter-arrival time between account updates in microseconds",
+        vec![10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0],
+    )
+});
+static INTRA_SLOT_INTERARRIVAL_US: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::new(
+        "yellowstone_grpc_intra_slot_interarrival_us",
+        "Inter-arrival time between account updates in the same slot in microseconds",
+        vec![10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0],
+    )
+});
+static SLOT_SPAN_US: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::new(
+        "yellowstone_grpc_slot_span_us",
+        "Time from first to last account update in a slot in microseconds",
+        vec![
+            100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0, 100_000.0,
+        ],
+    )
+});
+static SLOT_UPDATE_COUNT: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::new(
+        "yellowstone_grpc_slot_update_count",
+        "Account update count observed per slot",
+        vec![1.0, 10.0, 100.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0],
+    )
+});
 
 fn register_yellowstone_metrics() {
     let registry = MetricsRegistry::global();
@@ -97,10 +134,82 @@ fn register_yellowstone_metrics() {
     registry.register_histogram(&ACCOUNT_PROCESS_TIME_NANOS);
     registry.register_histogram(&ACCOUNT_DELETION_PROCESS_TIME_NANOS);
     registry.register_histogram(&TRANSACTION_PROCESS_TIME_NANOS);
+    registry.register_histogram(&ACCOUNT_INTERARRIVAL_US);
+    registry.register_histogram(&INTRA_SLOT_INTERARRIVAL_US);
+    registry.register_histogram(&SLOT_SPAN_US);
+    registry.register_histogram(&SLOT_UPDATE_COUNT);
 }
 
 /// Default timeout for detecting stale connections (30 seconds)
 pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_METRICS_SERVICE: &str = "unknown";
+const DEFAULT_METRICS_REGION: &str = "unknown";
+const DEFAULT_METRICS_SOURCE: &str = "yellowstone-grpc";
+const DEFAULT_METRICS_SUBSCRIPTION: &str = "default";
+const MAX_METRICS_LABEL_LEN: usize = 96;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct YellowstoneGrpcSubscriptionMetricsLabels {
+    pub service: String,
+    pub region: String,
+    pub source: String,
+    pub subscription: String,
+}
+
+impl YellowstoneGrpcSubscriptionMetricsLabels {
+    pub fn new(
+        service: impl Into<String>,
+        region: impl Into<String>,
+        source: impl Into<String>,
+        subscription: impl Into<String>,
+    ) -> Self {
+        Self {
+            service: sanitize_metric_label(service, DEFAULT_METRICS_SERVICE),
+            region: sanitize_metric_label(region, DEFAULT_METRICS_REGION),
+            source: sanitize_metric_label(source, DEFAULT_METRICS_SOURCE),
+            subscription: sanitize_metric_label(subscription, DEFAULT_METRICS_SUBSCRIPTION),
+        }
+    }
+
+    fn sanitized(self) -> Self {
+        Self::new(self.service, self.region, self.source, self.subscription)
+    }
+}
+
+impl Default for YellowstoneGrpcSubscriptionMetricsLabels {
+    fn default() -> Self {
+        Self::new(
+            first_env_label(&["SERVICE_NAME", "OTEL_SERVICE_NAME", "K_SERVICE"]),
+            first_env_label(&["REGION", "GCP_REGION", "AWS_REGION"]),
+            first_env_label(&["YELLOWSTONE_SOURCE_NAME", "GEYSER_SOURCE_NAME"]),
+            first_env_label(&["YELLOWSTONE_SUBSCRIPTION_NAME", "GEYSER_SUBSCRIPTION_NAME"]),
+        )
+    }
+}
+
+fn first_env_label(names: &[&str]) -> String {
+    names
+        .iter()
+        .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+        .unwrap_or_default()
+}
+
+fn sanitize_metric_label(value: impl Into<String>, default: &str) -> String {
+    let mut sanitized = String::with_capacity(MAX_METRICS_LABEL_LEN);
+    for ch in value.into().trim().chars().take(MAX_METRICS_LABEL_LEN) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    if sanitized.is_empty() {
+        default.to_string()
+    } else {
+        sanitized
+    }
+}
 
 /// Initial delay before retrying a failed subscription attempt
 const RECONNECT_INITIAL_DELAY_MS: u64 = 100;
@@ -120,6 +229,7 @@ pub struct YellowstoneGrpcGeyserClient {
     pub disconnect_notifier: Option<mpsc::Sender<DatasourceDisconnection>>,
     /// Timeout for detecting hung/stale connections. Default: 30 seconds.
     pub stream_timeout: Duration,
+    pub metrics_labels: YellowstoneGrpcSubscriptionMetricsLabels,
 }
 
 #[derive(Debug, Clone)]
@@ -181,7 +291,13 @@ impl YellowstoneGrpcGeyserClient {
             disconnect_notifier,
             stream_timeout: stream_timeout
                 .unwrap_or(Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS)),
+            metrics_labels: YellowstoneGrpcSubscriptionMetricsLabels::default(),
         }
+    }
+
+    pub fn with_metrics_labels(mut self, labels: YellowstoneGrpcSubscriptionMetricsLabels) -> Self {
+        self.metrics_labels = labels.sanitized();
+        self
     }
 }
 
@@ -245,6 +361,189 @@ impl YellowstoneGrpcClientConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum YellowstoneGrpcUpdateType {
+    Account,
+    Slot,
+    Transaction,
+    TransactionStatus,
+    Block,
+    Ping,
+    Pong,
+    BlockMeta,
+    Entry,
+    Other,
+}
+
+impl YellowstoneGrpcUpdateType {
+    fn from_update(update: &Option<UpdateOneof>) -> Self {
+        match update {
+            Some(UpdateOneof::Account(_)) => Self::Account,
+            Some(UpdateOneof::Slot(_)) => Self::Slot,
+            Some(UpdateOneof::Transaction(_)) => Self::Transaction,
+            Some(UpdateOneof::TransactionStatus(_)) => Self::TransactionStatus,
+            Some(UpdateOneof::Block(_)) => Self::Block,
+            Some(UpdateOneof::Ping(_)) => Self::Ping,
+            Some(UpdateOneof::Pong(_)) => Self::Pong,
+            Some(UpdateOneof::BlockMeta(_)) => Self::BlockMeta,
+            Some(UpdateOneof::Entry(_)) => Self::Entry,
+            None => Self::Other,
+        }
+    }
+
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Slot => "slot",
+            Self::Transaction => "transaction",
+            Self::TransactionStatus => "transaction_status",
+            Self::Block => "block",
+            Self::Ping => "ping",
+            Self::Pong => "pong",
+            Self::BlockMeta => "block_meta",
+            Self::Entry => "entry",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct YellowstoneGrpcUpdateMetricHandles {
+    bytes: metrics::Counter,
+    messages: metrics::Counter,
+    message_bytes: metrics::Histogram,
+}
+
+impl YellowstoneGrpcUpdateMetricHandles {
+    fn new(
+        labels: &YellowstoneGrpcSubscriptionMetricsLabels,
+        update_type: YellowstoneGrpcUpdateType,
+    ) -> Self {
+        let metric_labels = ingress_update_metric_labels(labels, update_type.as_label());
+
+        Self {
+            bytes: metrics::counter!(
+                "yellowstone_grpc_ingress_bytes_total",
+                metric_labels.clone()
+            ),
+            messages: metrics::counter!(
+                "yellowstone_grpc_ingress_messages_total",
+                metric_labels.clone()
+            ),
+            message_bytes: metrics::histogram!(
+                "yellowstone_grpc_ingress_message_bytes",
+                metric_labels
+            ),
+        }
+    }
+
+    fn record(&self, encoded_len: usize) {
+        self.bytes.increment(encoded_len as u64);
+        self.messages.increment(1);
+        self.message_bytes.record(encoded_len as f64);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct YellowstoneGrpcIngressMetricHandles {
+    connected: metrics::Gauge,
+    account: YellowstoneGrpcUpdateMetricHandles,
+    slot: YellowstoneGrpcUpdateMetricHandles,
+    transaction: YellowstoneGrpcUpdateMetricHandles,
+    transaction_status: YellowstoneGrpcUpdateMetricHandles,
+    block: YellowstoneGrpcUpdateMetricHandles,
+    ping: YellowstoneGrpcUpdateMetricHandles,
+    pong: YellowstoneGrpcUpdateMetricHandles,
+    block_meta: YellowstoneGrpcUpdateMetricHandles,
+    entry: YellowstoneGrpcUpdateMetricHandles,
+    other: YellowstoneGrpcUpdateMetricHandles,
+}
+
+impl YellowstoneGrpcIngressMetricHandles {
+    fn new(labels: YellowstoneGrpcSubscriptionMetricsLabels) -> Self {
+        let connection_labels = ingress_connection_metric_labels(&labels);
+
+        Self {
+            connected: metrics::gauge!(
+                "yellowstone_grpc_subscription_connected",
+                connection_labels
+            ),
+            account: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::Account,
+            ),
+            slot: YellowstoneGrpcUpdateMetricHandles::new(&labels, YellowstoneGrpcUpdateType::Slot),
+            transaction: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::Transaction,
+            ),
+            transaction_status: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::TransactionStatus,
+            ),
+            block: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::Block,
+            ),
+            ping: YellowstoneGrpcUpdateMetricHandles::new(&labels, YellowstoneGrpcUpdateType::Ping),
+            pong: YellowstoneGrpcUpdateMetricHandles::new(&labels, YellowstoneGrpcUpdateType::Pong),
+            block_meta: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::BlockMeta,
+            ),
+            entry: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::Entry,
+            ),
+            other: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::Other,
+            ),
+        }
+    }
+
+    fn set_connected(&self, connected: bool) {
+        self.connected.set(if connected { 1.0 } else { 0.0 });
+    }
+
+    fn record_message(&self, update: &Option<UpdateOneof>, encoded_len: usize) {
+        let handles = match YellowstoneGrpcUpdateType::from_update(update) {
+            YellowstoneGrpcUpdateType::Account => &self.account,
+            YellowstoneGrpcUpdateType::Slot => &self.slot,
+            YellowstoneGrpcUpdateType::Transaction => &self.transaction,
+            YellowstoneGrpcUpdateType::TransactionStatus => &self.transaction_status,
+            YellowstoneGrpcUpdateType::Block => &self.block,
+            YellowstoneGrpcUpdateType::Ping => &self.ping,
+            YellowstoneGrpcUpdateType::Pong => &self.pong,
+            YellowstoneGrpcUpdateType::BlockMeta => &self.block_meta,
+            YellowstoneGrpcUpdateType::Entry => &self.entry,
+            YellowstoneGrpcUpdateType::Other => &self.other,
+        };
+
+        handles.record(encoded_len);
+    }
+}
+
+fn ingress_connection_metric_labels(
+    labels: &YellowstoneGrpcSubscriptionMetricsLabels,
+) -> Vec<metrics::Label> {
+    vec![
+        metrics::Label::new("service", labels.service.clone()),
+        metrics::Label::new("region", labels.region.clone()),
+        metrics::Label::new("source", labels.source.clone()),
+        metrics::Label::new("subscription", labels.subscription.clone()),
+    ]
+}
+
+fn ingress_update_metric_labels(
+    labels: &YellowstoneGrpcSubscriptionMetricsLabels,
+    update_type: &'static str,
+) -> Vec<metrics::Label> {
+    let mut metric_labels = ingress_connection_metric_labels(labels);
+    metric_labels.push(metrics::Label::new("update_type", update_type));
+    metric_labels
+}
+
 #[async_trait]
 impl Datasource for YellowstoneGrpcGeyserClient {
     async fn consume(
@@ -280,6 +579,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
         let disconnect_tx_clone = self.disconnect_notifier.clone();
         let stream_timeout = self.stream_timeout;
+        let ingress_metrics = YellowstoneGrpcIngressMetricHandles::new(self.metrics_labels.clone());
 
         tokio::spawn(async move {
             let subscribe_request = SubscribeRequest {
@@ -320,6 +620,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         log::info!("Cancelling Yellowstone gRPC subscription.");
+                        ingress_metrics.set_connected(false);
                         // Log final arrival stats
                         if arrival_count > 1 {
                             let avg_delta_us = total_delta_us / (arrival_count - 1);
@@ -334,6 +635,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                         match result {
                             Ok((mut subscribe_tx, mut stream)) => {
                                 reconnect_delay = Duration::from_millis(RECONNECT_INITIAL_DELAY_MS);
+                                ingress_metrics.set_connected(true);
                                 let mut first_message_after_reconnect = last_disconnect_time.is_some();
 
                                 loop {
@@ -370,6 +672,11 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
                                     match message {
                                         Ok(msg) => {
+                                            ingress_metrics.record_message(
+                                                &msg.update_oneof,
+                                                msg.encoded_len(),
+                                            );
+
                                             if first_message_after_reconnect {
                                                 let current_slot = match &msg.update_oneof {
                                                     Some(UpdateOneof::Account(ref update)) => Some(update.slot),
@@ -414,15 +721,9 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     if update_slot != prev_slot {
                                                         if let (Some(first), Some(last)) = (slot_first_arrival, slot_last_arrival) {
                                                             let span_us = last.duration_since(first).as_micros() as u64;
-                                                            let _ = metrics.record_histogram(
-                                                                "yellowstone_grpc_slot_span_us",
-                                                                span_us as f64,
-                                                            ).await;
+                                                            SLOT_SPAN_US.record(span_us as f64);
                                                         }
-                                                        let _ = metrics.record_histogram(
-                                                            "yellowstone_grpc_slot_update_count",
-                                                            slot_update_count as f64,
-                                                        ).await;
+                                                        SLOT_UPDATE_COUNT.record(slot_update_count as f64);
 
                                                         // Reset for new slot
                                                         slot_first_arrival = Some(arrival_time);
@@ -433,10 +734,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                         // Same slot - track intra-slot inter-arrival
                                                         if let Some(last_slot_arrival) = slot_last_arrival {
                                                             let intra_delta_us = arrival_time.duration_since(last_slot_arrival).as_micros() as u64;
-                                                            let _ = metrics.record_histogram(
-                                                                "yellowstone_grpc_intra_slot_interarrival_us",
-                                                                intra_delta_us as f64,
-                                                            ).await;
+                                                            INTRA_SLOT_INTERARRIVAL_US.record(intra_delta_us as f64);
                                                         }
                                                         slot_last_arrival = Some(arrival_time);
                                                         slot_update_count += 1;
@@ -454,10 +752,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     total_delta_us += delta_us;
                                                     min_delta_us = min_delta_us.min(delta_us);
                                                     max_delta_us = max_delta_us.max(delta_us);
-                                                    let _ = metrics.record_histogram(
-                                                        "yellowstone_grpc_account_interarrival_us",
-                                                        delta_us as f64,
-                                                    ).await;
+                                                    ACCOUNT_INTERARRIVAL_US.record(delta_us as f64);
                                                 }
                                                 last_account_arrival = Some(arrival_time);
                                                 arrival_count += 1;
@@ -543,9 +838,11 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                         }
                                     }
                                 }
+                                ingress_metrics.set_connected(false);
                             }
                             Err(e) => {
                                 log::error!("Failed to subscribe: {e:?}");
+                                ingress_metrics.set_connected(false);
 
                                 if last_disconnect_time.is_none() {
                                     last_disconnect_time = Some(Utc::now());
