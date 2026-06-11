@@ -22,16 +22,22 @@ Changes maintained on top of [sevenlabs-hq/carbon](https://github.com/sevenlabs-
 - Global account inter-arrival deltas (`yellowstone_grpc_account_interarrival_us`)
 - Debug logging every 5000 account updates, final stats on cancellation
 
-### Jetstreamer transaction_slot_index fix
-- Cherry-picked from upstream feature branch (327ba10c)
-- Uses `transaction.transaction_slot_index` instead of `None` for the transaction index field
+### Yellowstone ingress byte metrics
+- Decoded protobuf payload byte counter (`yellowstone_grpc_ingress_bytes_total`)
+- Message counter (`yellowstone_grpc_ingress_messages_total`)
+- Message size histogram (`yellowstone_grpc_ingress_message_bytes`)
+- Subscription connection gauge (`yellowstone_grpc_subscription_connected`)
+- Labels: `service`, `region`, `source`, `subscription`, and `update_type` for payload metrics
+
+### Already upstream in v1
+- Jetstreamer now uses `transaction.transaction_slot_index` for the transaction index field
 
 ## Rebasing onto upstream
 
 ```bash
 git fetch upstream
-git reset --hard upstream/main
-# Re-apply commits from this fork (they are clean, linear commits on top of upstream/main)
-git cherry-pick <write_version commit>..<HEAD>
-git push origin main --force
+git switch -c kulture/upstream-v1-polaris upstream/main
+# Re-apply the fork commits that still differ from upstream.
+git cherry-pick <write_version> <shredstream-empty-signature> <yellowstone-timing> <fork-docs> <yellowstone-ingress-bytes>
+git push origin kulture/upstream-v1-polaris
 ```
