@@ -31,10 +31,15 @@ use {
             subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
             SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocks,
             SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdateAccountInfo,
-            SubscribeUpdateTransactionInfo,
+            SubscribeUpdate, SubscribeUpdateTransactionInfo,
         },
         prost::Message,
-        tonic::{codec::CompressionEncoding, transport::ClientTlsConfig},
+        tonic::{
+            codec::{CompressionEncoding, Streaming},
+            metadata::AsciiMetadataValue,
+            transport::ClientTlsConfig,
+            Request,
+        },
     },
 };
 
@@ -216,6 +221,44 @@ const RECONNECT_INITIAL_DELAY_MS: u64 = 100;
 
 /// Upper bound on the retry delay
 const RECONNECT_MAX_DELAY_MS: u64 = 3_000;
+
+async fn subscribe_with_subscription_id<F>(
+    geyser_client: &mut GeyserGrpcClient<F>,
+    subscribe_request: SubscribeRequest,
+    subscription_id: &str,
+) -> Result<
+    (
+        futures::channel::mpsc::UnboundedSender<SubscribeRequest>,
+        Streaming<SubscribeUpdate>,
+    ),
+    String,
+>
+where
+    F: yellowstone_grpc_client::Interceptor,
+{
+    let (mut subscribe_tx, subscribe_rx) = futures::channel::mpsc::unbounded();
+    subscribe_tx
+        .send(subscribe_request)
+        .await
+        .map_err(|error| format!("failed to send initial subscribe request: {error}"))?;
+
+    let mut request = Request::new(subscribe_rx);
+    let subscription_id = sanitize_metric_label(subscription_id, DEFAULT_METRICS_SUBSCRIPTION);
+    let subscription_id = subscription_id
+        .parse::<AsciiMetadataValue>()
+        .map_err(|error| format!("invalid x-subscription-id metadata value: {error}"))?;
+    request
+        .metadata_mut()
+        .insert("x-subscription-id", subscription_id);
+
+    geyser_client
+        .geyser
+        .subscribe(request)
+        .await
+        .map(|response| response.into_inner())
+        .map(|stream| (subscribe_tx, stream))
+        .map_err(|error| error.to_string())
+}
 
 #[derive(Debug)]
 pub struct YellowstoneGrpcGeyserClient {
@@ -580,6 +623,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
         let disconnect_tx_clone = self.disconnect_notifier.clone();
         let stream_timeout = self.stream_timeout;
         let ingress_metrics = YellowstoneGrpcIngressMetricHandles::new(self.metrics_labels.clone());
+        let subscription_id = self.metrics_labels.subscription.clone();
 
         tokio::spawn(async move {
             let subscribe_request = SubscribeRequest {
@@ -631,7 +675,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                         }
                         break;
                     }
-                    result = geyser_client.subscribe_with_request(Some(subscribe_request.clone())) => {
+                    result = subscribe_with_subscription_id(&mut geyser_client, subscribe_request.clone(), &subscription_id) => {
                         match result {
                             Ok((mut subscribe_tx, mut stream)) => {
                                 reconnect_delay = Duration::from_millis(RECONNECT_INITIAL_DELAY_MS);
