@@ -32,6 +32,18 @@ Changes maintained on top of [sevenlabs-hq/carbon](https://github.com/sevenlabs-
 ### Already upstream in v1
 - Jetstreamer now uses `transaction.transaction_slot_index` for the transaction index field
 
+### Jetstreamer historical transaction metadata
+- `carbon-jetstreamer-datasource` now requests block callbacks whenever transaction
+  callbacks are enabled, even if the caller did not request public `BlockDetails`
+  updates.
+- Matching transactions are buffered by `(thread_id, slot)` until the block callback
+  provides historical `block_time` and `blockhash`.
+- Buffered transactions are emitted with `TransactionUpdate.block_time` and
+  `TransactionUpdate.block_hash` populated from the historical block, allowing
+  downstream backfill writers to use block time instead of wall-clock ingest time.
+- Any transactions left buffered after firehose completion are flushed without
+  block metadata and counted via `jetstreamer_transactions_sent_without_block_time_total`.
+
 ## Rebasing onto upstream
 
 ```bash
