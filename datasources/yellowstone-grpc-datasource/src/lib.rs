@@ -28,8 +28,8 @@ use {
         geyser::{
             subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
             SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocks,
-            SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdateAccountInfo,
-            SubscribeUpdate, SubscribeUpdateTransactionInfo,
+            SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
+            SubscribeUpdateAccountInfo, SubscribeUpdateTransactionInfo,
         },
         prost::Message,
         tonic::{
@@ -772,6 +772,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     id_for_loop.clone(),
                                                     update_slot,
                                                     &account_deletions_tracked,
+                                                    &cancellation_token,
                                                 )
                                                 .await
                                             }
@@ -784,6 +785,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     id_for_loop.clone(),
                                                     transaction_update.slot,
                                                     None,
+                                                    &cancellation_token,
                                                 )
                                                 .await
                                             }
@@ -793,7 +795,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
                                                 for transaction_update in block_update.transactions {
                                                     if retain_block_failed_transactions || transaction_update.meta.as_ref().map(|meta| meta.err.is_none()).unwrap_or(false) {
-                                                        send_subscribe_update_transaction_info(Some(transaction_update), &sender, id_for_loop.clone(), block_update.slot, block_time).await
+                                                        send_subscribe_update_transaction_info(Some(transaction_update), &sender, id_for_loop.clone(), block_update.slot, block_time, &cancellation_token).await
                                                     }
                                                 }
 
@@ -804,6 +806,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                         id_for_loop.clone(),
                                                         block_update.slot,
                                                         &account_deletions_tracked,
+                                                        &cancellation_token,
                                                     )
                                                     .await;
                                                 }
@@ -876,6 +879,7 @@ async fn send_subscribe_account_update_info(
     id: DatasourceId,
     slot: u64,
     account_deletions_tracked: &RwLock<HashSet<Pubkey>>,
+    cancellation_token: &CancellationToken,
 ) {
     let start_time = std::time::Instant::now();
 
@@ -910,9 +914,15 @@ async fn send_subscribe_account_update_info(
                         .and_then(|sig| Signature::try_from(sig).ok()),
                 };
                 if let Err(e) = sender.try_send((Update::AccountDeletion(account_deletion), id)) {
-                    log::error!(
-                        "Failed to send account deletion update for pubkey {account_pubkey:?} at slot {slot}: {e:?}"
-                    );
+                    if expected_closed_send_after_cancellation(&e, cancellation_token) {
+                        log::debug!(
+                            "Account deletion output closed after datasource cancellation for pubkey {account_pubkey:?} at slot {slot}"
+                        );
+                    } else {
+                        log::error!(
+                            "Failed to send account deletion update for pubkey {account_pubkey:?} at slot {slot}: {e:?}"
+                        );
+                    }
                 }
             }
         } else {
@@ -927,9 +937,15 @@ async fn send_subscribe_account_update_info(
             });
 
             if let Err(e) = sender.try_send((update, id)) {
-                log::error!(
-                    "Failed to send account update for pubkey {account_pubkey:?} at slot {slot}: {e:?}"
-                );
+                if expected_closed_send_after_cancellation(&e, cancellation_token) {
+                    log::debug!(
+                        "Account output closed after datasource cancellation for pubkey {account_pubkey:?} at slot {slot}"
+                    );
+                } else {
+                    log::error!(
+                        "Failed to send account update for pubkey {account_pubkey:?} at slot {slot}: {e:?}"
+                    );
+                }
             }
         }
 
@@ -946,6 +962,7 @@ async fn send_subscribe_update_transaction_info(
     id: DatasourceId,
     slot: u64,
     block_time: Option<i64>,
+    cancellation_token: &CancellationToken,
 ) {
     let start_time = std::time::Instant::now();
 
@@ -980,9 +997,15 @@ async fn send_subscribe_update_transaction_info(
             block_hash: None,
         }));
         if let Err(e) = sender.try_send((update, id)) {
-            log::error!(
-                "Failed to send transaction update with signature {signature:?} at slot {slot}: {e:?}"
-            );
+            if expected_closed_send_after_cancellation(&e, cancellation_token) {
+                log::debug!(
+                    "Transaction output closed after datasource cancellation for signature {signature:?} at slot {slot}"
+                );
+            } else {
+                log::error!(
+                    "Failed to send transaction update with signature {signature:?} at slot {slot}: {e:?}"
+                );
+            }
             return;
         }
 
@@ -990,5 +1013,36 @@ async fn send_subscribe_update_transaction_info(
         TRANSACTION_UPDATES_RECEIVED.inc();
     } else {
         log::error!("No transaction info in `UpdateOneof::Transaction` at slot {slot}");
+    }
+}
+
+fn expected_closed_send_after_cancellation<T>(
+    error: &mpsc::error::TrySendError<T>,
+    cancellation_token: &CancellationToken,
+) -> bool {
+    cancellation_token.is_cancelled() && matches!(error, mpsc::error::TrySendError::Closed(_))
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn only_closed_send_after_owned_cancellation_is_expected() {
+        let token = CancellationToken::new();
+        let (sender, receiver) = mpsc::channel::<u8>(1);
+
+        sender.try_send(1).unwrap();
+        let full = sender.try_send(2).unwrap_err();
+        assert!(!expected_closed_send_after_cancellation(&full, &token));
+        token.cancel();
+        assert!(!expected_closed_send_after_cancellation(&full, &token));
+
+        drop(receiver);
+        let closed = sender.try_send(3).unwrap_err();
+        assert!(expected_closed_send_after_cancellation(&closed, &token));
+
+        let active = CancellationToken::new();
+        assert!(!expected_closed_send_after_cancellation(&closed, &active));
     }
 }
