@@ -47,7 +47,15 @@ impl {{ instruction.name | pascalCase }} {
         data_slice = &data_slice[{{ discriminatorManifest.size }}..];
 {% endif %}
 
+{% if strictInstructions %}
+        let decoded = borsh::BorshDeserialize::deserialize(&mut data_slice).ok()?;
+        if !data_slice.is_empty() {
+            return None;
+        }
+        Some(decoded)
+{% else %}
         borsh::BorshDeserialize::deserialize(&mut data_slice).ok()
+{% endif %}
     }
 }
 
@@ -64,6 +72,11 @@ impl ArrangeAccounts for {{ instruction.name | pascalCase }} {
         let {{ macros.escapeRustKeyword(account.name | snakeCase) }} = next_account(&mut iter){% if not account.isOptional %}?{% endif %};
 {% endfor %}
 
+{% if strictInstructions %}
+        if !iter.as_slice().is_empty() {
+            return None;
+        }
+{% endif %}
         let remaining = iter.as_slice();
 
         Some({{ instruction.name | pascalCase }}InstructionAccounts {
@@ -73,6 +86,11 @@ impl ArrangeAccounts for {{ instruction.name | pascalCase }} {
             remaining: remaining.to_vec(),
         })
 {% else %}
+{% if strictInstructions %}
+        if !_accounts.is_empty() {
+            return None;
+        }
+{% endif %}
         Some({{ instruction.name | pascalCase }}InstructionAccounts {})
 {% endif %}
     }

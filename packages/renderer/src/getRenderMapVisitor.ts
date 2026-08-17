@@ -117,6 +117,7 @@ export type GetRenderMapOptions = {
     packageMetadata?: PackageMetadata;
     version?: string;
     versionName?: string;
+    strictInstructions?: boolean;
 };
 
 export function getRenderMapVisitor(options: GetRenderMapOptions = {}) {
@@ -626,6 +627,7 @@ export function getRenderMapVisitor(options: GetRenderMapOptions = {}) {
                             argumentTypes,
                             imports: imports.toString(),
                             instruction: instructionWithUniqueAccounts,
+                            strictInstructions: options.strictInstructions ?? false,
                             discriminatorManifest,
                             program: currentProgram,
                             withBase58: options.withBase58 ?? false,
