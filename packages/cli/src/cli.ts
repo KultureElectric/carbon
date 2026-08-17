@@ -76,6 +76,11 @@ program
     .option('--categories <csv>', 'Package categories, comma-separated (default: encoding)')
     .option('--package-version <string>', 'Package version in Cargo.toml (default: 0.1.0)')
     .option('--version-name <name>', 'Decoder version name (e.g., "v1", "v2")')
+    .option(
+        '--strict-instructions',
+        'Reject trailing instruction bytes and extra accounts instead of preserving them',
+        false,
+    )
     .option('--no-clean', 'Do not delete output directory before rendering')
     .action(async opts => {
         showBanner();
@@ -145,6 +150,7 @@ program
                 packageMetadata,
                 version: opts.packageVersion,
                 versionName: opts.versionName,
+                strictInstructions: Boolean(opts.strictInstructions),
             });
 
             logger.succeedSpinner('Decoder generated');

@@ -82,6 +82,7 @@ export type DecoderGenerationOptions = {
     packageMetadata?: PackageMetadata;
     version?: string;
     versionName?: string;
+    strictInstructions?: boolean;
 };
 
 export type IdlMetadata = {
@@ -239,6 +240,7 @@ export async function generateDecoder(options: DecoderGenerationOptions): Promis
         packageMetadata,
         version,
         versionName,
+        strictInstructions,
     } = options;
 
     const idlSource = parseIdlSource(idl);
@@ -259,6 +261,7 @@ export async function generateDecoder(options: DecoderGenerationOptions): Promis
         packageMetadata,
         version,
         versionName,
+        strictInstructions,
     };
 
     // Load IDL from program address or file
@@ -332,6 +335,7 @@ export async function generateDecoder(options: DecoderGenerationOptions): Promis
                 packageMetadata,
                 version: options.version,
                 versionName: options.versionName,
+                strictInstructions,
             }),
         );
     }
