@@ -4,6 +4,14 @@ import { LinkableDictionary, visit } from '@codama/visitors-core';
 import { definedTypeLinkNode, isNode } from '@codama/nodes';
 import { createFromRoot } from 'codama';
 import { rootNodeFromAnchorWithoutDefaultVisitor } from '@codama/nodes-from-anchor';
+import JSONbig from 'json-bigint';
+
+const losslessJson = JSONbig({ storeAsString: true });
+
+/** Parse IDLs without rounding integer discriminants above Number.MAX_SAFE_INTEGER. */
+export function parseIdlJson(source: string): any {
+    return losslessJson.parse(source);
+}
 
 export function hasLegacyEvents(idlJson: any): boolean {
     if (!idlJson.events || !Array.isArray(idlJson.events) || idlJson.events.length === 0) {

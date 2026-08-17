@@ -29,25 +29,29 @@ function encodedStringToBytes(value: string, encoding: BytesEncoding): number[] 
     }
 }
 
-function numberToBytes(num: number, format: string, endian: 'be' | 'le'): number[] {
+function numberToBytes(num: number | string | bigint, format: string, endian: 'be' | 'le'): number[] {
+    let value = BigInt(num);
+    const takeByte = (): number => {
+        const byte = Number(value & 0xffn);
+        value >>= 8n;
+        return byte;
+    };
     let bytes: number[];
 
     switch (format) {
         case 'u8':
-            bytes = [num & 0xff];
+            bytes = [takeByte()];
             break;
         case 'u16':
-            bytes = [num & 0xff, (num >> 8) & 0xff];
+            bytes = [takeByte(), takeByte()];
             break;
         case 'u32':
-            bytes = [num & 0xff, (num >> 8) & 0xff, (num >> 16) & 0xff, (num >> 24) & 0xff];
+            bytes = [takeByte(), takeByte(), takeByte(), takeByte()];
             break;
         case 'u64': {
             bytes = [];
-            let n = num;
             for (let i = 0; i < 8; i++) {
-                bytes.push(n & 0xff);
-                n = Math.floor(n / 256);
+                bytes.push(takeByte());
             }
             break;
         }
