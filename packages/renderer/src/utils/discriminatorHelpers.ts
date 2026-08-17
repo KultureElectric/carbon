@@ -24,20 +24,25 @@ function hexToBytes(hex: string): number[] {
     return bytes;
 }
 
-function numberToBytes(num: number, format: string): number[] {
+function numberToBytes(num: number | string | bigint, format: string): number[] {
+    let value = BigInt(num);
+    const takeByte = (): number => {
+        const byte = Number(value & 0xffn);
+        value >>= 8n;
+        return byte;
+    };
+
     switch (format) {
         case 'u8':
-            return [num & 0xff];
+            return [takeByte()];
         case 'u16':
-            return [num & 0xff, (num >> 8) & 0xff];
+            return [takeByte(), takeByte()];
         case 'u32':
-            return [num & 0xff, (num >> 8) & 0xff, (num >> 16) & 0xff, (num >> 24) & 0xff];
+            return [takeByte(), takeByte(), takeByte(), takeByte()];
         case 'u64': {
             const bytes: number[] = [];
-            let n = num;
             for (let i = 0; i < 8; i++) {
-                bytes.push(n & 0xff);
-                n = Math.floor(n / 256);
+                bytes.push(takeByte());
             }
             return bytes;
         }

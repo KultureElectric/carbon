@@ -22,6 +22,7 @@ import {
     fixPdaSeedArgumentPaths,
     fixPdaSeedAccountReferences,
     hasNestedInstructionArguments,
+    parseIdlJson,
 } from './idl-transformer';
 
 /**
@@ -194,7 +195,7 @@ export async function getIdlMetadata(
         idlJson = await fetchAnchorIdl(idl, url);
     } else {
         const idlPath = resolve(process.cwd(), idl);
-        idlJson = JSON.parse(readFileSync(idlPath, 'utf8'));
+        idlJson = parseIdlJson(readFileSync(idlPath, 'utf8'));
     }
 
     // Extract name and convert to kebab-case
@@ -278,7 +279,7 @@ export async function generateDecoder(options: DecoderGenerationOptions): Promis
         }
     } else {
         const idlPath = resolve(process.cwd(), idl);
-        idlJson = JSON.parse(readFileSync(idlPath, 'utf8'));
+        idlJson = parseIdlJson(readFileSync(idlPath, 'utf8'));
         const idlAddress = getValidIdlAddress(idlJson);
         const programAddress = idlAddress || programId;
         if (!programAddress) {
