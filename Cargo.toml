@@ -1,6 +1,11 @@
 [workspace]
 members = ["crates/*", "datasources/*", "decoders/*", "examples/*", "metrics/*"]
-exclude = ["datasources/jetstreamer-datasource", "examples/jetstreamer"]
+# These legacy Solana 3 consumers cannot share the Solana 4 workspace graph.
+exclude = [
+    "datasources/helius-atlas-ws-datasource",
+    "datasources/jetstreamer-datasource",
+    "examples/jetstreamer",
+]
 resolver = "2"
 
 [workspace.package]
