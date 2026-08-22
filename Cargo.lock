@@ -14172,6 +14172,7 @@ dependencies = [
  "solana-transaction-context 4.1.2",
  "solana-transaction-error",
  "solana-transaction-status 4.1.2",
+ "thiserror 2.0.18",
  "yellowstone-grpc-proto",
 ]
 
