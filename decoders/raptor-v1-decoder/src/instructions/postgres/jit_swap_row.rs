@@ -139,7 +139,7 @@ impl carbon_core::postgres::operations::Delete for JitSwapRow {
 }
 
 #[async_trait::async_trait]
-impl carbon_core::postgres::operations::LookUp for JitSwapRow {
+impl carbon_core::postgres::operations::Lookup for JitSwapRow {
     type Key = (
         String,
         carbon_core::postgres::primitives::U32,

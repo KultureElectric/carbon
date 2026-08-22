@@ -31,15 +31,13 @@ impl From<(RaptorV1Account, carbon_core::account::AccountMetadata)>
 
 #[async_trait::async_trait]
 impl carbon_core::postgres::operations::Insert for RaptorV1AccountWithMetadata {
-    async fn insert(&self, pool: &sqlx::PgPool) -> carbon_core::error::CarbonResult<()> {
-        let RaptorV1AccountWithMetadata(account, metadata) = self;
-        match account {
-            _ => unreachable!("No accounts to decode"),
-        }
+    async fn insert(&self, _pool: &sqlx::PgPool) -> carbon_core::error::CarbonResult<()> {
+        Ok(())
     }
 }
+#[async_trait::async_trait]
 impl carbon_core::postgres::operations::Upsert for RaptorV1AccountWithMetadata {
-    async fn upsert(&self, pool: &sqlx::PgPool) -> carbon_core::error::CarbonResult<()> {
+    async fn upsert(&self, _pool: &sqlx::PgPool) -> carbon_core::error::CarbonResult<()> {
         Ok(())
     }
 }

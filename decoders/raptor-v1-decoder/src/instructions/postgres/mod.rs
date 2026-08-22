@@ -65,42 +65,42 @@ impl carbon_core::postgres::operations::Insert for RaptorV1InstructionWithMetada
     async fn insert(&self, pool: &sqlx::PgPool) -> carbon_core::error::CarbonResult<()> {
         let RaptorV1InstructionWithMetadata(instruction, metadata) = self;
         match instruction {
-            RaptorV1Instruction::Claim(instruction) => {
-                let row = claim_row::ClaimRow::from_parts(instruction.clone(), metadata.clone());
+            RaptorV1Instruction::Claim { data, .. } => {
+                let row = claim_row::ClaimRow::from_parts(data.clone(), metadata.clone());
                 row.insert(pool).await?;
                 Ok(())
             }
-            RaptorV1Instruction::CreateTokenAccount(instruction) => {
+            RaptorV1Instruction::CreateTokenAccount { data, .. } => {
                 let row = create_token_account_row::CreateTokenAccountRow::from_parts(
-                    instruction.clone(),
+                    data.clone(),
                     metadata.clone(),
                 );
                 row.insert(pool).await?;
                 Ok(())
             }
-            RaptorV1Instruction::CreateTokenAccountWithSeed(instruction) => {
+            RaptorV1Instruction::CreateTokenAccountWithSeed { data, .. } => {
                 let row =
                     create_token_account_with_seed_row::CreateTokenAccountWithSeedRow::from_parts(
-                        instruction.clone(),
+                        data.clone(),
                         metadata.clone(),
                     );
                 row.insert(pool).await?;
                 Ok(())
             }
-            RaptorV1Instruction::JitSwap(instruction) => {
+            RaptorV1Instruction::JitSwap { data, .. } => {
                 let row =
-                    jit_swap_row::JitSwapRow::from_parts(instruction.clone(), metadata.clone());
+                    jit_swap_row::JitSwapRow::from_parts(data.clone(), metadata.clone());
                 row.insert(pool).await?;
                 Ok(())
             }
-            RaptorV1Instruction::Swap(instruction) => {
-                let row = swap_row::SwapRow::from_parts(instruction.clone(), metadata.clone());
+            RaptorV1Instruction::Swap { data, .. } => {
+                let row = swap_row::SwapRow::from_parts(data.clone(), metadata.clone());
                 row.insert(pool).await?;
                 Ok(())
             }
-            RaptorV1Instruction::CpiEvent(instruction) => {
+            RaptorV1Instruction::CpiEvent { data, .. } => {
                 let row =
-                    cpi_event_row::CpiEventRow::from_parts(instruction.clone(), metadata.clone());
+                    cpi_event_row::CpiEventRow::from_parts(data.clone(), metadata.clone());
                 row.insert(pool).await?;
                 Ok(())
             }
@@ -113,42 +113,42 @@ impl carbon_core::postgres::operations::Upsert for RaptorV1InstructionWithMetada
     async fn upsert(&self, pool: &sqlx::PgPool) -> carbon_core::error::CarbonResult<()> {
         let RaptorV1InstructionWithMetadata(instruction, metadata) = self;
         match instruction {
-            RaptorV1Instruction::Claim(instruction) => {
-                let row = claim_row::ClaimRow::from_parts(instruction.clone(), metadata.clone());
+            RaptorV1Instruction::Claim { data, .. } => {
+                let row = claim_row::ClaimRow::from_parts(data.clone(), metadata.clone());
                 row.upsert(pool).await?;
                 Ok(())
             }
-            RaptorV1Instruction::CreateTokenAccount(instruction) => {
+            RaptorV1Instruction::CreateTokenAccount { data, .. } => {
                 let row = create_token_account_row::CreateTokenAccountRow::from_parts(
-                    instruction.clone(),
+                    data.clone(),
                     metadata.clone(),
                 );
                 row.upsert(pool).await?;
                 Ok(())
             }
-            RaptorV1Instruction::CreateTokenAccountWithSeed(instruction) => {
+            RaptorV1Instruction::CreateTokenAccountWithSeed { data, .. } => {
                 let row =
                     create_token_account_with_seed_row::CreateTokenAccountWithSeedRow::from_parts(
-                        instruction.clone(),
+                        data.clone(),
                         metadata.clone(),
                     );
                 row.upsert(pool).await?;
                 Ok(())
             }
-            RaptorV1Instruction::JitSwap(instruction) => {
+            RaptorV1Instruction::JitSwap { data, .. } => {
                 let row =
-                    jit_swap_row::JitSwapRow::from_parts(instruction.clone(), metadata.clone());
+                    jit_swap_row::JitSwapRow::from_parts(data.clone(), metadata.clone());
                 row.upsert(pool).await?;
                 Ok(())
             }
-            RaptorV1Instruction::Swap(instruction) => {
-                let row = swap_row::SwapRow::from_parts(instruction.clone(), metadata.clone());
+            RaptorV1Instruction::Swap { data, .. } => {
+                let row = swap_row::SwapRow::from_parts(data.clone(), metadata.clone());
                 row.upsert(pool).await?;
                 Ok(())
             }
-            RaptorV1Instruction::CpiEvent(instruction) => {
+            RaptorV1Instruction::CpiEvent { data, .. } => {
                 let row =
-                    cpi_event_row::CpiEventRow::from_parts(instruction.clone(), metadata.clone());
+                    cpi_event_row::CpiEventRow::from_parts(data.clone(), metadata.clone());
                 row.upsert(pool).await?;
                 Ok(())
             }
