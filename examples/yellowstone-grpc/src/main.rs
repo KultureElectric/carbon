@@ -33,6 +33,7 @@ pub async fn main() -> CarbonResult<()> {
             account_exclude: vec![],
             account_required: vec![JUPITER_SWAP_PROGRAM_ID.to_string()],
             signature: None,
+            ..Default::default()
         },
     );
 
