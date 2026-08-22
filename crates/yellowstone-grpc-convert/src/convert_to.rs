@@ -1,8 +1,11 @@
 use {
+    crate::ConversionError,
     solana_clock::UnixTimestamp,
     solana_message::{
-        compiled_instruction::CompiledInstruction, v0::MessageAddressTableLookup, MessageHeader,
-        VersionedMessage,
+        compiled_instruction::CompiledInstruction,
+        v0::MessageAddressTableLookup,
+        v1::{MAX_TRANSACTION_SIZE, SIGNATURE_SIZE},
+        MessageHeader, VersionedMessage,
     },
     solana_pubkey::Pubkey,
     solana_signature::Signature,
@@ -16,19 +19,27 @@ use {
     yellowstone_grpc_proto::prelude as proto,
 };
 
-pub fn create_transaction(tx: &VersionedTransaction) -> proto::Transaction {
-    proto::Transaction {
+pub fn create_transaction(
+    tx: &VersionedTransaction,
+) -> Result<proto::Transaction, ConversionError> {
+    if matches!(tx.message, VersionedMessage::V1(_))
+        && tx.signatures.len() != usize::from(tx.message.header().num_required_signatures)
+    {
+        return Err(ConversionError::InvalidV1SignatureCount);
+    }
+
+    Ok(proto::Transaction {
         signatures: tx
             .signatures
             .iter()
             .map(|signature| <Signature as AsRef<[u8]>>::as_ref(signature).into())
             .collect(),
-        message: Some(create_message(&tx.message)),
-    }
+        message: Some(create_message(&tx.message)?),
+    })
 }
 
-pub fn create_message(message: &VersionedMessage) -> proto::Message {
-    match message {
+pub fn create_message(message: &VersionedMessage) -> Result<proto::Message, ConversionError> {
+    Ok(match message {
         VersionedMessage::Legacy(message) => proto::Message {
             header: Some(create_header(&message.header)),
             account_keys: create_pubkeys(&message.account_keys),
@@ -47,8 +58,31 @@ pub fn create_message(message: &VersionedMessage) -> proto::Message {
             address_table_lookups: create_lookups(&message.address_table_lookups),
             config: None,
         },
-        VersionedMessage::V1(_) => panic!("v1 transactions not supported"),
-    }
+        VersionedMessage::V1(message) => {
+            message.validate()?;
+            let transaction_size = 1usize.saturating_add(message.size()).saturating_add(
+                usize::from(message.header.num_required_signatures).saturating_mul(SIGNATURE_SIZE),
+            );
+            if transaction_size > MAX_TRANSACTION_SIZE {
+                return Err(ConversionError::V1TransactionTooLarge);
+            }
+
+            proto::Message {
+                header: Some(create_header(&message.header)),
+                account_keys: create_pubkeys(&message.account_keys),
+                recent_blockhash: message.lifetime_specifier.to_bytes().into(),
+                instructions: create_instructions(&message.instructions),
+                versioned: true,
+                address_table_lookups: vec![],
+                config: Some(proto::TransactionConfig {
+                    priority_fee: message.config.priority_fee,
+                    compute_unit_limit: message.config.compute_unit_limit,
+                    loaded_accounts_data_size_limit: message.config.loaded_accounts_data_size_limit,
+                    heap_size: message.config.heap_size,
+                }),
+            }
+        }
+    })
 }
 
 pub const fn create_header(header: &MessageHeader) -> proto::MessageHeader {
@@ -247,6 +281,7 @@ mod tests {
         solana_hash::Hash,
         solana_message::{
             v0::{Message as MessageV0, MessageAddressTableLookup},
+            v1::{Message as MessageV1, TransactionConfig},
             Message as LegacyMessage,
         },
     };
@@ -276,7 +311,7 @@ mod tests {
             instructions: vec![instruction()],
         });
 
-        let encoded = create_message(&message);
+        let encoded = create_message(&message).unwrap();
         assert!(!encoded.versioned);
         assert!(encoded.address_table_lookups.is_empty());
         assert!(encoded.config.is_none());
@@ -297,7 +332,7 @@ mod tests {
             }],
         });
 
-        let encoded = create_message(&message);
+        let encoded = create_message(&message).unwrap();
         assert!(encoded.versioned);
         assert_eq!(encoded.address_table_lookups.len(), 1);
         assert!(encoded.config.is_none());
@@ -308,6 +343,58 @@ mod tests {
     fn deactivated_stake_reward_type_round_trips_without_downgrade() {
         let encoded = create_reward_type(Some(RewardType::DeactivatedStake));
         assert_eq!(encoded, proto::RewardType::DeactivatedStake);
+    }
+
+    #[test]
+    fn v1_transaction_encodes_all_config_fields_and_signatures() {
+        let signature = Signature::from([23; 64]);
+        let transaction = VersionedTransaction {
+            signatures: vec![signature],
+            message: VersionedMessage::V1(MessageV1::new(
+                header(),
+                TransactionConfig {
+                    priority_fee: Some(42),
+                    compute_unit_limit: Some(900_000),
+                    loaded_accounts_data_size_limit: Some(128 * 1024),
+                    heap_size: Some(64 * 1024),
+                },
+                Hash::new_from_array([31; 32]),
+                vec![Pubkey::new_unique(), Pubkey::new_unique()],
+                vec![instruction()],
+            )),
+        };
+
+        let encoded = create_transaction(&transaction).unwrap();
+        assert_eq!(encoded.signatures, vec![signature.as_ref().to_vec()]);
+        let message = encoded.message.as_ref().unwrap();
+        assert!(message.versioned);
+        assert!(message.address_table_lookups.is_empty());
+        assert_eq!(
+            message.header,
+            Some(create_header(transaction.message.header()))
+        );
+        assert_eq!(
+            message.account_keys,
+            create_pubkeys(transaction.message.static_account_keys())
+        );
+        assert_eq!(message.recent_blockhash, vec![31; 32]);
+        assert_eq!(
+            message.instructions,
+            create_instructions(transaction.message.instructions())
+        );
+        assert_eq!(
+            message.config,
+            Some(proto::TransactionConfig {
+                priority_fee: Some(42),
+                compute_unit_limit: Some(900_000),
+                loaded_accounts_data_size_limit: Some(128 * 1024),
+                heap_size: Some(64 * 1024),
+            })
+        );
+        assert_eq!(
+            convert_from::create_tx_versioned(encoded).unwrap(),
+            transaction
+        );
     }
 }
 
