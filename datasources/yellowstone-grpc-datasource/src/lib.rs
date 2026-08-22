@@ -16,7 +16,7 @@ use {
     std::{
         collections::{HashMap, HashSet},
         convert::TryFrom,
-        env,
+        env, fmt,
         sync::{Arc, LazyLock},
         time::Duration,
     },
@@ -644,7 +644,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                 ingress_metrics.set_connected(true);
                                 let mut first_message_after_reconnect = last_disconnect_time.is_some();
 
-                                loop {
+                                'stream_generation: loop {
                                     if cancellation_token.is_cancelled() {
                                         break;
                                     }
@@ -720,7 +720,6 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                             Some(UpdateOneof::Account(account_update)) => {
                                                 let arrival_time = std::time::Instant::now();
                                                 let update_slot = account_update.slot;
-                                                last_processed_slot = update_slot;
 
                                                 // Check if slot changed - emit metrics for previous slot
                                                 if let Some(prev_slot) = current_slot {
@@ -771,7 +770,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     );
                                                 }
 
-                                                send_subscribe_account_update_info(
+                                                if let Err(error) = send_subscribe_account_update_info(
                                                     account_update.account,
                                                     &sender,
                                                     id_for_loop.clone(),
@@ -779,12 +778,20 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     &account_deletions_tracked,
                                                     &cancellation_token,
                                                 )
-                                                .await
+                                                .await {
+                                                    record_authoritative_output_failure(
+                                                        &error,
+                                                        &mut last_disconnect_time,
+                                                        &mut last_slot_before_disconnect,
+                                                        last_processed_slot,
+                                                    );
+                                                    break 'stream_generation;
+                                                }
+                                                last_processed_slot = update_slot;
                                             }
 
                                             Some(UpdateOneof::Transaction(transaction_update)) => {
-                                                last_processed_slot = transaction_update.slot;
-                                                send_subscribe_update_transaction_info(
+                                                if let Err(error) = send_subscribe_update_transaction_info(
                                                     transaction_update.transaction,
                                                     &sender,
                                                     id_for_loop.clone(),
@@ -792,20 +799,36 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     None,
                                                     &cancellation_token,
                                                 )
-                                                .await
+                                                .await {
+                                                    record_authoritative_output_failure(
+                                                        &error,
+                                                        &mut last_disconnect_time,
+                                                        &mut last_slot_before_disconnect,
+                                                        last_processed_slot,
+                                                    );
+                                                    break 'stream_generation;
+                                                }
+                                                last_processed_slot = transaction_update.slot;
                                             }
                                             Some(UpdateOneof::Block(block_update)) => {
-                                                last_processed_slot = block_update.slot;
                                                 let block_time = block_update.block_time.map(|ts| ts.timestamp);
 
                                                 for transaction_update in block_update.transactions {
                                                     if retain_block_failed_transactions || transaction_update.meta.as_ref().map(|meta| meta.err.is_none()).unwrap_or(false) {
-                                                        send_subscribe_update_transaction_info(Some(transaction_update), &sender, id_for_loop.clone(), block_update.slot, block_time, &cancellation_token).await
+                                                        if let Err(error) = send_subscribe_update_transaction_info(Some(transaction_update), &sender, id_for_loop.clone(), block_update.slot, block_time, &cancellation_token).await {
+                                                            record_authoritative_output_failure(
+                                                                &error,
+                                                                &mut last_disconnect_time,
+                                                                &mut last_slot_before_disconnect,
+                                                                last_processed_slot,
+                                                            );
+                                                            break 'stream_generation;
+                                                        }
                                                     }
                                                 }
 
                                                 for account_info in block_update.accounts {
-                                                    send_subscribe_account_update_info(
+                                                    if let Err(error) = send_subscribe_account_update_info(
                                                         Some(account_info),
                                                         &sender,
                                                         id_for_loop.clone(),
@@ -813,8 +836,17 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                         &account_deletions_tracked,
                                                         &cancellation_token,
                                                     )
-                                                    .await;
+                                                    .await {
+                                                        record_authoritative_output_failure(
+                                                            &error,
+                                                            &mut last_disconnect_time,
+                                                            &mut last_slot_before_disconnect,
+                                                            last_processed_slot,
+                                                        );
+                                                        break 'stream_generation;
+                                                    }
                                                 }
+                                                last_processed_slot = block_update.slot;
                                             }
 
                                             Some(UpdateOneof::Ping(_)) => {
@@ -885,16 +917,16 @@ async fn send_subscribe_account_update_info(
     slot: u64,
     account_deletions_tracked: &RwLock<HashSet<Pubkey>>,
     cancellation_token: &CancellationToken,
-) {
+) -> Result<(), AuthoritativeOutputError> {
     let start_time = std::time::Instant::now();
 
     if let Some(account_info) = account_update_info {
         let Ok(account_pubkey) = Pubkey::try_from(account_info.pubkey) else {
-            return;
+            return Ok(());
         };
 
         let Ok(account_owner_pubkey) = Pubkey::try_from(account_info.owner) else {
-            return;
+            return Ok(());
         };
 
         let account = Account {
@@ -918,16 +950,14 @@ async fn send_subscribe_account_update_info(
                         .txn_signature
                         .and_then(|sig| Signature::try_from(sig).ok()),
                 };
-                if let Err(e) = sender.try_send((Update::AccountDeletion(account_deletion), id)) {
-                    if expected_closed_send_after_cancellation(&e, cancellation_token) {
-                        log::debug!(
-                            "Account deletion output closed after datasource cancellation for pubkey {account_pubkey:?} at slot {slot}"
-                        );
-                    } else {
-                        log::error!(
-                            "Failed to send account deletion update for pubkey {account_pubkey:?} at slot {slot}: {e:?}"
-                        );
-                    }
+                if !try_send_authoritative_update(
+                    sender,
+                    Update::AccountDeletion(account_deletion),
+                    id,
+                    slot,
+                    cancellation_token,
+                )? {
+                    return Ok(());
                 }
             }
         } else {
@@ -941,16 +971,8 @@ async fn send_subscribe_account_update_info(
                 write_version: Some(account_info.write_version),
             });
 
-            if let Err(e) = sender.try_send((update, id)) {
-                if expected_closed_send_after_cancellation(&e, cancellation_token) {
-                    log::debug!(
-                        "Account output closed after datasource cancellation for pubkey {account_pubkey:?} at slot {slot}"
-                    );
-                } else {
-                    log::error!(
-                        "Failed to send account update for pubkey {account_pubkey:?} at slot {slot}: {e:?}"
-                    );
-                }
+            if !try_send_authoritative_update(sender, update, id, slot, cancellation_token)? {
+                return Ok(());
             }
         }
 
@@ -959,6 +981,8 @@ async fn send_subscribe_account_update_info(
     } else {
         log::error!("No account info in UpdateOneof::Account at slot {slot}");
     }
+
+    Ok(())
 }
 
 async fn send_subscribe_update_transaction_info(
@@ -968,7 +992,7 @@ async fn send_subscribe_update_transaction_info(
     slot: u64,
     block_time: Option<i64>,
     cancellation_token: &CancellationToken,
-) {
+) -> Result<(), AuthoritativeOutputError> {
     let start_time = std::time::Instant::now();
 
     let transaction_update = transaction_info
@@ -981,17 +1005,11 @@ async fn send_subscribe_update_transaction_info(
         Ok(transaction_update) => {
             let signature = transaction_update.signature;
             let update = Update::Transaction(Box::new(transaction_update));
-            if let Err(e) = sender.try_send((update, id)) {
-                if expected_closed_send_after_cancellation(&e, cancellation_token) {
-                    log::debug!(
+            if !try_send_authoritative_update(sender, update, id, slot, cancellation_token)? {
+                log::debug!(
                     "Transaction output closed after datasource cancellation for signature {signature:?} at slot {slot}"
                 );
-                } else {
-                    log::error!(
-                    "Failed to send transaction update with signature {signature:?} at slot {slot}: {e:?}"
-                );
-                }
-                return;
+                return Ok(());
             }
 
             TRANSACTION_PROCESS_TIME_NANOS.record(start_time.elapsed().as_nanos() as f64);
@@ -1011,6 +1029,66 @@ async fn send_subscribe_update_transaction_info(
                 );
             }
         }
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AuthoritativeOutputError {
+    Full { update_type: UpdateType, slot: u64 },
+    Closed { update_type: UpdateType, slot: u64 },
+}
+
+impl fmt::Display for AuthoritativeOutputError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let (state, update_type, slot) = match self {
+            Self::Full { update_type, slot } => ("full", update_type, slot),
+            Self::Closed { update_type, slot } => ("closed", update_type, slot),
+        };
+        write!(
+            formatter,
+            "authoritative output channel {state} for {update_type:?} at slot {slot}"
+        )
+    }
+}
+
+fn try_send_authoritative_update(
+    sender: &Sender<(Update, DatasourceId)>,
+    update: Update,
+    id: DatasourceId,
+    slot: u64,
+    cancellation_token: &CancellationToken,
+) -> Result<bool, AuthoritativeOutputError> {
+    let update_type = update.update_type();
+    match sender.try_send((update, id)) {
+        Ok(()) => Ok(true),
+        Err(error) if expected_closed_send_after_cancellation(&error, cancellation_token) => {
+            log::debug!(
+                "Authoritative {update_type:?} output closed after datasource cancellation at slot {slot}"
+            );
+            Ok(false)
+        }
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            Err(AuthoritativeOutputError::Full { update_type, slot })
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            Err(AuthoritativeOutputError::Closed { update_type, slot })
+        }
+    }
+}
+
+fn record_authoritative_output_failure(
+    error: &AuthoritativeOutputError,
+    last_disconnect_time: &mut Option<DateTime<Utc>>,
+    last_slot_before_disconnect: &mut Option<u64>,
+    last_processed_slot: u64,
+) {
+    log::error!("{error}; invalidating Yellowstone stream generation for reconnect");
+    if last_disconnect_time.is_none() {
+        *last_disconnect_time = Some(Utc::now());
+        *last_slot_before_disconnect = Some(last_processed_slot);
+        log::error!("Disconnected at last delivered slot {last_processed_slot}");
     }
 }
 
@@ -1126,6 +1204,19 @@ mod cancellation_tests {
         }
     }
 
+    fn account_info() -> SubscribeUpdateAccountInfo {
+        SubscribeUpdateAccountInfo {
+            pubkey: Pubkey::new_unique().to_bytes().to_vec(),
+            lamports: 1,
+            owner: solana_system_interface::program::ID.to_bytes().to_vec(),
+            executable: false,
+            rent_epoch: 0,
+            data: vec![],
+            write_version: 1,
+            txn_signature: None,
+        }
+    }
+
     #[test]
     fn only_closed_send_after_owned_cancellation_is_expected() {
         let token = CancellationToken::new();
@@ -1160,7 +1251,8 @@ mod cancellation_tests {
             None,
             &cancellation_token,
         )
-        .await;
+        .await
+        .unwrap();
         send_subscribe_update_transaction_info(
             Some(v1_transaction_info(32 * 1024)),
             &sender,
@@ -1169,7 +1261,8 @@ mod cancellation_tests {
             None,
             &cancellation_token,
         )
-        .await;
+        .await
+        .unwrap();
 
         assert_eq!(TRANSACTION_UPDATES_REJECTED.get(), rejected_before + 1);
         let (Update::Transaction(update), _) = receiver.recv().await.unwrap() else {
@@ -1178,5 +1271,99 @@ mod cancellation_tests {
         assert_eq!(update.slot, 101);
         assert_eq!(update.transaction.message.static_account_keys().len(), 2);
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn full_block_transaction_output_fails_the_stream_generation() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let id = DatasourceId::new_named("test");
+        let cancellation_token = CancellationToken::new();
+
+        send_subscribe_update_transaction_info(
+            Some(v1_transaction_info(32 * 1024)),
+            &sender,
+            id.clone(),
+            200,
+            Some(1_700_000_000),
+            &cancellation_token,
+        )
+        .await
+        .unwrap();
+
+        let error = send_subscribe_update_transaction_info(
+            Some(v1_transaction_info(32 * 1024)),
+            &sender,
+            id,
+            201,
+            Some(1_700_000_001),
+            &cancellation_token,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            AuthoritativeOutputError::Full {
+                update_type: UpdateType::Transaction,
+                slot: 201,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn full_account_output_fails_the_stream_generation() {
+        let (sender, _receiver) = mpsc::channel(1);
+        let id = DatasourceId::new_named("test");
+        let cancellation_token = CancellationToken::new();
+        let tracked_deletions = RwLock::new(HashSet::new());
+
+        send_subscribe_account_update_info(
+            Some(account_info()),
+            &sender,
+            id.clone(),
+            300,
+            &tracked_deletions,
+            &cancellation_token,
+        )
+        .await
+        .unwrap();
+
+        let error = send_subscribe_account_update_info(
+            Some(account_info()),
+            &sender,
+            id,
+            301,
+            &tracked_deletions,
+            &cancellation_token,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            AuthoritativeOutputError::Full {
+                update_type: UpdateType::AccountUpdate,
+                slot: 301,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn closed_output_after_cancellation_does_not_fail_the_stream_generation() {
+        let (sender, receiver) = mpsc::channel(1);
+        let cancellation_token = CancellationToken::new();
+        cancellation_token.cancel();
+        drop(receiver);
+
+        send_subscribe_update_transaction_info(
+            Some(v1_transaction_info(32 * 1024)),
+            &sender,
+            DatasourceId::new_named("test"),
+            400,
+            None,
+            &cancellation_token,
+        )
+        .await
+        .unwrap();
     }
 }
