@@ -273,6 +273,25 @@ pub const fn create_reward_type(reward_type: Option<RewardType>) -> proto::Rewar
     }
 }
 
+pub const fn create_num_partitions(num_partitions: u64) -> proto::NumPartitions {
+    proto::NumPartitions { num_partitions }
+}
+
+pub fn create_return_data(return_data: &TransactionReturnData) -> proto::ReturnData {
+    proto::ReturnData {
+        program_id: return_data.program_id.to_bytes().into(),
+        data: return_data.data.clone(),
+    }
+}
+
+pub const fn create_block_height(block_height: u64) -> proto::BlockHeight {
+    proto::BlockHeight { block_height }
+}
+
+pub const fn create_timestamp(timestamp: UnixTimestamp) -> proto::UnixTimestamp {
+    proto::UnixTimestamp { timestamp }
+}
+
 #[cfg(test)]
 mod tests {
     use {
@@ -396,23 +415,4 @@ mod tests {
             transaction
         );
     }
-}
-
-pub const fn create_num_partitions(num_partitions: u64) -> proto::NumPartitions {
-    proto::NumPartitions { num_partitions }
-}
-
-pub fn create_return_data(return_data: &TransactionReturnData) -> proto::ReturnData {
-    proto::ReturnData {
-        program_id: return_data.program_id.to_bytes().into(),
-        data: return_data.data.clone(),
-    }
-}
-
-pub const fn create_block_height(block_height: u64) -> proto::BlockHeight {
-    proto::BlockHeight { block_height }
-}
-
-pub const fn create_timestamp(timestamp: UnixTimestamp) -> proto::UnixTimestamp {
-    proto::UnixTimestamp { timestamp }
 }

@@ -388,8 +388,7 @@ fn take_account_data(account: &mut proto::SubscribeUpdateAccountInfo) -> Vec<u8>
     // If only one reference remains (say this instance), during `into()`, it won't
     // copy the vector Compared to `Bytes:to_vec`, it should not allocate new
     // memory.
-    let bytes = std::mem::take(&mut account.data);
-    bytes.into()
+    std::mem::take(&mut account.data)
 }
 
 #[cfg(not(feature = "account-data-as-bytes"))]
