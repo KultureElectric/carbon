@@ -31,8 +31,8 @@ use {
         geyser::{
             subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
             SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocks,
-            SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
-            SubscribeUpdateAccountInfo, SubscribeUpdateTransactionInfo,
+            SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions, SubscribeRequestPing,
+            SubscribeUpdate, SubscribeUpdateAccountInfo, SubscribeUpdateTransactionInfo,
         },
         prost::Message,
         tonic::{
@@ -158,6 +158,7 @@ const DEFAULT_METRICS_REGION: &str = "unknown";
 const DEFAULT_METRICS_SOURCE: &str = "yellowstone-grpc";
 const DEFAULT_METRICS_SUBSCRIPTION: &str = "default";
 const MAX_METRICS_LABEL_LEN: usize = 96;
+const SOURCE_CONTROL_SLOT_FILTER: &str = "carbon_source_control";
 
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub struct YellowstoneGrpcSubscriptionMetricsLabels {
@@ -227,6 +228,16 @@ const RECONNECT_INITIAL_DELAY_MS: u64 = 100;
 
 /// Upper bound on the retry delay
 const RECONNECT_MAX_DELAY_MS: u64 = 3_000;
+
+fn source_control_slot_filters() -> HashMap<String, SubscribeRequestFilterSlots> {
+    HashMap::from([(
+        SOURCE_CONTROL_SLOT_FILTER.to_owned(),
+        SubscribeRequestFilterSlots {
+            filter_by_commitment: Some(true),
+            interslot_updates: Some(false),
+        },
+    )])
+}
 
 async fn subscribe_with_subscription_id<F>(
     geyser_client: &mut GeyserGrpcClient<F>,
@@ -424,6 +435,66 @@ enum YellowstoneGrpcUpdateType {
     Other,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IngressProgressObservation {
+    ping: bool,
+    slot: Option<u64>,
+}
+
+impl IngressProgressObservation {
+    fn from_update(update: &Option<UpdateOneof>) -> Self {
+        Self {
+            ping: matches!(update, Some(UpdateOneof::Ping(_))),
+            slot: match update {
+                Some(UpdateOneof::Account(update)) => Some(update.slot),
+                Some(UpdateOneof::Slot(update)) => Some(update.slot),
+                Some(UpdateOneof::Transaction(update)) => Some(update.slot),
+                Some(UpdateOneof::TransactionStatus(update)) => Some(update.slot),
+                Some(UpdateOneof::Block(update)) => Some(update.slot),
+                Some(UpdateOneof::BlockMeta(update)) => Some(update.slot),
+                Some(UpdateOneof::Entry(update)) => Some(update.slot),
+                Some(UpdateOneof::Ping(_) | UpdateOneof::Pong(_)) | None => None,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum YellowstoneTransactionVersion {
+    Legacy,
+    V0,
+    V1,
+    Unknown,
+}
+
+impl YellowstoneTransactionVersion {
+    fn from_transaction_info(transaction_info: Option<&SubscribeUpdateTransactionInfo>) -> Self {
+        let Some(message) = transaction_info
+            .and_then(|info| info.transaction.as_ref())
+            .and_then(|transaction| transaction.message.as_ref())
+        else {
+            return Self::Unknown;
+        };
+
+        if message.config.is_some() {
+            Self::V1
+        } else if message.versioned {
+            Self::V0
+        } else {
+            Self::Legacy
+        }
+    }
+
+    const fn as_label(self) -> &'static str {
+        match self {
+            Self::Legacy => "legacy",
+            Self::V0 => "v0",
+            Self::V1 => "v1",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 impl YellowstoneGrpcUpdateType {
     fn from_update(update: &Option<UpdateOneof>) -> Self {
         match update {
@@ -495,7 +566,12 @@ impl YellowstoneGrpcUpdateMetricHandles {
 
 #[derive(Debug, Clone)]
 struct YellowstoneGrpcIngressMetricHandles {
+    labels: YellowstoneGrpcSubscriptionMetricsLabels,
     connected: metrics::Gauge,
+    last_control_progress_timestamp_seconds: metrics::Gauge,
+    last_ping_timestamp_seconds: metrics::Gauge,
+    last_slot: metrics::Gauge,
+    last_slot_progress_timestamp_seconds: metrics::Gauge,
     account: YellowstoneGrpcUpdateMetricHandles,
     slot: YellowstoneGrpcUpdateMetricHandles,
     transaction: YellowstoneGrpcUpdateMetricHandles,
@@ -512,9 +588,23 @@ impl YellowstoneGrpcIngressMetricHandles {
     fn new(labels: YellowstoneGrpcSubscriptionMetricsLabels) -> Self {
         let connection_labels = ingress_connection_metric_labels(&labels);
 
-        Self {
+        let handles = Self {
+            labels: labels.clone(),
             connected: metrics::gauge!(
                 "yellowstone_grpc_subscription_connected",
+                connection_labels.clone()
+            ),
+            last_control_progress_timestamp_seconds: metrics::gauge!(
+                "yellowstone_grpc_last_control_progress_timestamp_seconds",
+                connection_labels.clone()
+            ),
+            last_ping_timestamp_seconds: metrics::gauge!(
+                "yellowstone_grpc_last_ping_timestamp_seconds",
+                connection_labels.clone()
+            ),
+            last_slot: metrics::gauge!("yellowstone_grpc_last_slot", connection_labels.clone()),
+            last_slot_progress_timestamp_seconds: metrics::gauge!(
+                "yellowstone_grpc_last_slot_progress_timestamp_seconds",
                 connection_labels
             ),
             account: YellowstoneGrpcUpdateMetricHandles::new(
@@ -548,7 +638,13 @@ impl YellowstoneGrpcIngressMetricHandles {
                 &labels,
                 YellowstoneGrpcUpdateType::Other,
             ),
-        }
+        };
+        handles.set_connected(false);
+        handles.last_control_progress_timestamp_seconds.set(0.0);
+        handles.last_ping_timestamp_seconds.set(0.0);
+        handles.last_slot.set(0.0);
+        handles.last_slot_progress_timestamp_seconds.set(0.0);
+        handles
     }
 
     fn set_connected(&self, connected: bool) {
@@ -556,6 +652,31 @@ impl YellowstoneGrpcIngressMetricHandles {
     }
 
     fn record_message(&self, update: &Option<UpdateOneof>, encoded_len: usize) {
+        self.record_message_at(
+            update,
+            encoded_len,
+            Utc::now().timestamp_millis() as f64 / 1_000.0,
+        );
+    }
+
+    fn record_message_at(
+        &self,
+        update: &Option<UpdateOneof>,
+        encoded_len: usize,
+        observed_at_seconds: f64,
+    ) {
+        let progress = IngressProgressObservation::from_update(update);
+        self.last_control_progress_timestamp_seconds
+            .set(observed_at_seconds);
+        if progress.ping {
+            self.last_ping_timestamp_seconds.set(observed_at_seconds);
+        }
+        if let Some(slot) = progress.slot {
+            self.last_slot.set(slot as f64);
+            self.last_slot_progress_timestamp_seconds
+                .set(observed_at_seconds);
+        }
+
         let handles = match YellowstoneGrpcUpdateType::from_update(update) {
             YellowstoneGrpcUpdateType::Account => &self.account,
             YellowstoneGrpcUpdateType::Slot => &self.slot,
@@ -570,6 +691,20 @@ impl YellowstoneGrpcIngressMetricHandles {
         };
 
         handles.record(encoded_len);
+    }
+
+    fn record_transaction_rejection(
+        &self,
+        version: YellowstoneTransactionVersion,
+        rejection: &TransactionUpdateRejection,
+    ) {
+        let mut labels = ingress_connection_metric_labels(&self.labels);
+        labels.push(metrics::Label::new(
+            "transaction_version",
+            version.as_label(),
+        ));
+        labels.push(metrics::Label::new("reason", rejection.metric_label()));
+        metrics::counter!("yellowstone_grpc_transaction_rejections_total", labels).increment(1);
     }
 }
 
@@ -633,7 +768,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
         tokio::spawn(async move {
             let subscribe_request = SubscribeRequest {
-                slots: HashMap::new(),
+                slots: source_control_slot_filters(),
                 accounts: account_filters,
                 transactions: transaction_filters,
                 transactions_status: HashMap::new(),
@@ -841,6 +976,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     transaction_update.slot,
                                                     None,
                                                     &cancellation_token,
+                                                    &ingress_metrics,
                                                 )
                                                 .await {
                                                     record_authoritative_output_failure(
@@ -858,7 +994,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
                                                 for transaction_update in block_update.transactions {
                                                     if retain_block_failed_transactions || transaction_update.meta.as_ref().map(|meta| meta.err.is_none()).unwrap_or(false) {
-                                                        if let Err(error) = send_subscribe_update_transaction_info(Some(transaction_update), &sender, id_for_loop.clone(), block_update.slot, block_time, &cancellation_token).await {
+                                                        if let Err(error) = send_subscribe_update_transaction_info(Some(transaction_update), &sender, id_for_loop.clone(), block_update.slot, block_time, &cancellation_token, &ingress_metrics).await {
                                                             record_authoritative_output_failure(
                                                                 &error,
                                                                 &mut last_disconnect_time,
@@ -1026,8 +1162,11 @@ async fn send_subscribe_update_transaction_info(
     slot: u64,
     block_time: Option<i64>,
     cancellation_token: &CancellationToken,
+    ingress_metrics: &YellowstoneGrpcIngressMetricHandles,
 ) -> Result<(), AuthoritativeOutputError> {
     let start_time = std::time::Instant::now();
+    let transaction_version =
+        YellowstoneTransactionVersion::from_transaction_info(transaction_info.as_ref());
 
     let transaction_update = transaction_info
         .ok_or(TransactionUpdateRejection::MissingInfo)
@@ -1051,6 +1190,7 @@ async fn send_subscribe_update_transaction_info(
         }
         Err(rejection) => {
             TRANSACTION_UPDATES_REJECTED.inc();
+            ingress_metrics.record_transaction_rejection(transaction_version, &rejection);
             if let Some(error) = rejection.conversion_error() {
                 log::warn!(
                     "Rejected Yellowstone transaction update at slot {slot}: {} ({error})",
@@ -1157,6 +1297,27 @@ impl TransactionUpdateRejection {
             | Self::MissingMeta => None,
         }
     }
+
+    const fn metric_label(&self) -> &'static str {
+        match self {
+            Self::MissingInfo => "missing_info",
+            Self::InvalidSignature => "invalid_signature",
+            Self::MissingTransaction => "missing_transaction",
+            Self::MissingMeta => "missing_meta",
+            Self::InvalidTransaction(ConversionError::Legacy(_)) => "invalid_transaction",
+            Self::InvalidTransaction(ConversionError::InvalidV1Message(_)) => "invalid_v1_message",
+            Self::InvalidTransaction(ConversionError::V1AddressTableLookups) => {
+                "v1_address_table_lookups"
+            }
+            Self::InvalidTransaction(ConversionError::V1TransactionTooLarge) => {
+                "v1_transaction_too_large"
+            }
+            Self::InvalidTransaction(ConversionError::InvalidV1SignatureCount) => {
+                "invalid_v1_signature_count"
+            }
+            Self::InvalidMeta(_) => "invalid_meta",
+        }
+    }
 }
 
 fn convert_transaction_update(
@@ -1251,6 +1412,70 @@ mod cancellation_tests {
         }
     }
 
+    fn ingress_metrics() -> YellowstoneGrpcIngressMetricHandles {
+        YellowstoneGrpcIngressMetricHandles::new(YellowstoneGrpcSubscriptionMetricsLabels::new(
+            "test-service",
+            "test-region",
+            "test-source",
+            "test-subscription",
+        ))
+    }
+
+    #[test]
+    fn source_control_uses_one_fixed_slot_filter_on_the_existing_subscription() {
+        let filters = source_control_slot_filters();
+
+        assert_eq!(filters.len(), 1);
+        let filter = filters
+            .get(SOURCE_CONTROL_SLOT_FILTER)
+            .expect("fixed source-control slot filter");
+        assert_eq!(filter.filter_by_commitment, Some(true));
+        assert_eq!(filter.interslot_updates, Some(false));
+    }
+
+    #[test]
+    fn source_progress_classifies_ping_and_slot_without_data_updates() {
+        let ping = Some(UpdateOneof::Ping(
+            yellowstone_grpc_proto::geyser::SubscribeUpdatePing::default(),
+        ));
+        assert_eq!(
+            IngressProgressObservation::from_update(&ping),
+            IngressProgressObservation {
+                ping: true,
+                slot: None,
+            }
+        );
+
+        let slot = Some(UpdateOneof::Slot(
+            yellowstone_grpc_proto::geyser::SubscribeUpdateSlot {
+                slot: 440_640_000,
+                parent: Some(440_639_999),
+                status: 0,
+                dead_error: None,
+            },
+        ));
+        assert_eq!(
+            IngressProgressObservation::from_update(&slot),
+            IngressProgressObservation {
+                ping: false,
+                slot: Some(440_640_000),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_v1_has_bounded_version_and_rejection_labels() {
+        let transaction_info = v1_transaction_info(32 * 1024 + 1);
+        assert_eq!(
+            YellowstoneTransactionVersion::from_transaction_info(Some(&transaction_info))
+                .as_label(),
+            "v1"
+        );
+
+        let rejection = convert_transaction_update(transaction_info, 500, None).unwrap_err();
+        assert_eq!(rejection.metric_label(), "invalid_v1_message");
+    }
+
     #[test]
     fn only_closed_send_after_owned_cancellation_is_expected() {
         let token = CancellationToken::new();
@@ -1276,6 +1501,7 @@ mod cancellation_tests {
         let id = DatasourceId::new_named("test");
         let cancellation_token = CancellationToken::new();
         let rejected_before = TRANSACTION_UPDATES_REJECTED.get();
+        let ingress_metrics = ingress_metrics();
 
         send_subscribe_update_transaction_info(
             Some(v1_transaction_info(32 * 1024 + 1)),
@@ -1284,6 +1510,7 @@ mod cancellation_tests {
             100,
             None,
             &cancellation_token,
+            &ingress_metrics,
         )
         .await
         .unwrap();
@@ -1294,6 +1521,7 @@ mod cancellation_tests {
             101,
             None,
             &cancellation_token,
+            &ingress_metrics,
         )
         .await
         .unwrap();
@@ -1312,6 +1540,7 @@ mod cancellation_tests {
         let (sender, _receiver) = mpsc::channel(1);
         let id = DatasourceId::new_named("test");
         let cancellation_token = CancellationToken::new();
+        let ingress_metrics = ingress_metrics();
 
         send_subscribe_update_transaction_info(
             Some(v1_transaction_info(32 * 1024)),
@@ -1320,6 +1549,7 @@ mod cancellation_tests {
             200,
             Some(1_700_000_000),
             &cancellation_token,
+            &ingress_metrics,
         )
         .await
         .unwrap();
@@ -1331,6 +1561,7 @@ mod cancellation_tests {
             201,
             Some(1_700_000_001),
             &cancellation_token,
+            &ingress_metrics,
         )
         .await
         .unwrap_err();
@@ -1384,6 +1615,7 @@ mod cancellation_tests {
         let cancellation_token = CancellationToken::new();
         cancellation_token.cancel();
         drop(receiver);
+        let ingress_metrics = ingress_metrics();
 
         send_subscribe_update_transaction_info(
             Some(v1_transaction_info(32 * 1024)),
@@ -1392,6 +1624,7 @@ mod cancellation_tests {
             400,
             None,
             &cancellation_token,
+            &ingress_metrics,
         )
         .await
         .unwrap();
