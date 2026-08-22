@@ -17,7 +17,11 @@ use {
         TransactionData,
     },
     solana_transaction_status_client_types::Reward,
-    std::collections::HashSet,
+    std::{
+        collections::{HashMap, HashSet},
+        sync::Arc,
+    },
+    tokio::sync::Mutex,
     tokio_util::sync::CancellationToken,
 };
 
@@ -49,6 +53,25 @@ static INTERNAL_TRANSACTIONS_PROCESSED: Gauge = Gauge::new(
     "jetstreamer_internal_transactions_processed",
     "Internal firehose transactions processed (from Stats)",
 );
+static INTERNAL_SLOT_HIGH_WATERMARK: Gauge = Gauge::new(
+    "jetstreamer_internal_slot_high_watermark",
+    "Highest slot observed by the internal firehose stats callback",
+);
+static TRANSACTIONS_BUFFERED_FOR_BLOCK_TIME: Counter = Counter::new(
+    "jetstreamer_transactions_buffered_for_block_time_total",
+    "Transactions buffered until block metadata is available",
+);
+static TRANSACTIONS_SENT_WITH_BLOCK_TIME: Counter = Counter::new(
+    "jetstreamer_transactions_sent_with_block_time_total",
+    "Transactions sent with historical block_time populated",
+);
+static TRANSACTIONS_SENT_WITHOUT_BLOCK_TIME: Counter = Counter::new(
+    "jetstreamer_transactions_sent_without_block_time_total",
+    "Transactions sent without block_time after the firehose finished",
+);
+
+type PendingTransactionKey = (usize, u64);
+type PendingTransactions = Arc<Mutex<HashMap<PendingTransactionKey, Vec<TransactionUpdate>>>>;
 
 fn register_jetstreamer_metrics() {
     let registry = MetricsRegistry::global();
@@ -56,9 +79,41 @@ fn register_jetstreamer_metrics() {
     registry.register_counter(&TRANSACTIONS_SENT);
     registry.register_counter(&TRANSACTIONS_FILTERED_OUT);
     registry.register_counter(&TRANSACTIONS_FILTERED_IN);
+    registry.register_counter(&TRANSACTIONS_BUFFERED_FOR_BLOCK_TIME);
+    registry.register_counter(&TRANSACTIONS_SENT_WITH_BLOCK_TIME);
+    registry.register_counter(&TRANSACTIONS_SENT_WITHOUT_BLOCK_TIME);
     registry.register_gauge(&INTERNAL_SLOTS_PROCESSED);
     registry.register_gauge(&INTERNAL_BLOCKS_PROCESSED);
     registry.register_gauge(&INTERNAL_TRANSACTIONS_PROCESSED);
+    registry.register_gauge(&INTERNAL_SLOT_HIGH_WATERMARK);
+}
+
+fn reset_jetstreamer_internal_stats() {
+    INTERNAL_SLOTS_PROCESSED.set(0.0);
+    INTERNAL_BLOCKS_PROCESSED.set(0.0);
+    INTERNAL_TRANSACTIONS_PROCESSED.set(0.0);
+    INTERNAL_SLOT_HIGH_WATERMARK.set(0.0);
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct JetstreamerStatsSnapshot {
+    pub slots_processed: u64,
+    pub blocks_processed: u64,
+    pub transactions_processed: u64,
+    pub slot_high_watermark: u64,
+}
+
+pub fn jetstreamer_internal_stats_snapshot() -> JetstreamerStatsSnapshot {
+    JetstreamerStatsSnapshot {
+        slots_processed: INTERNAL_SLOTS_PROCESSED.get().max(0.0) as u64,
+        blocks_processed: INTERNAL_BLOCKS_PROCESSED.get().max(0.0) as u64,
+        transactions_processed: INTERNAL_TRANSACTIONS_PROCESSED.get().max(0.0) as u64,
+        slot_high_watermark: INTERNAL_SLOT_HIGH_WATERMARK.get().max(0.0) as u64,
+    }
+}
+
+fn should_request_blocks(include_transactions: bool, include_blocks: bool) -> bool {
+    include_transactions || include_blocks
 }
 
 pub mod filter;
@@ -111,10 +166,12 @@ impl Datasource for JetstreamerDatasource {
         _cancellation_token: CancellationToken,
     ) -> CarbonResult<()> {
         register_jetstreamer_metrics();
+        reset_jetstreamer_internal_stats();
 
         let (start_slot, end_slot) = self.range.into_slots();
         let (include_transactions, include_blocks) =
             (self.filter.include_transactions, self.filter.include_blocks);
+        let pending_transactions: PendingTransactions = Arc::new(Mutex::new(HashMap::new()));
 
         if let Some(archive_url) = &self.archive_url {
             unsafe { std::env::set_var("JETSTREAMER_COMPACT_INDEX_BASE_URL", archive_url) }
@@ -126,22 +183,38 @@ impl Datasource for JetstreamerDatasource {
 
         let sender_for_block = sender.clone();
         let id_for_block = id.clone();
-        let on_block_fn = move |_thread_id: usize, block: BlockData| {
+        let pending_transactions_for_block = pending_transactions.clone();
+        let on_block_fn = move |thread_id: usize, block: BlockData| {
             let sender = sender_for_block.clone();
             let id = id_for_block.clone();
-            async move { JetstreamerDatasource::on_block(block, id, sender).await }.boxed()
+            let pending_transactions = pending_transactions_for_block.clone();
+            async move {
+                JetstreamerDatasource::on_block(
+                    thread_id,
+                    block,
+                    id,
+                    sender,
+                    pending_transactions,
+                    include_blocks,
+                )
+                .await
+            }
+            .boxed()
         };
 
-        let sender_for_transaction = sender.clone();
-        let id_for_transaction = id.clone();
         let filter_for_transaction = self.filter.transaction_filters.clone();
-        let on_transaction_fn = move |_thread_id: usize, transaction: TransactionData| {
-            let sender = sender_for_transaction.clone();
-            let id = id_for_transaction.clone();
+        let pending_transactions_for_transaction = pending_transactions.clone();
+        let on_transaction_fn = move |thread_id: usize, transaction: TransactionData| {
             let transaction_filters = filter_for_transaction.clone();
+            let pending_transactions = pending_transactions_for_transaction.clone();
             async move {
-                JetstreamerDatasource::on_transaction(transaction, id, sender, transaction_filters)
-                    .await
+                JetstreamerDatasource::on_transaction(
+                    thread_id,
+                    transaction,
+                    transaction_filters,
+                    pending_transactions,
+                )
+                .await
             }
             .boxed()
         };
@@ -160,7 +233,7 @@ impl Datasource for JetstreamerDatasource {
         let result = jetstreamer_firehose::firehose::firehose(
             self.threads,
             start_slot..end_slot,
-            if include_blocks {
+            if should_request_blocks(include_transactions, include_blocks) {
                 Some(on_block_fn)
             } else {
                 None
@@ -178,23 +251,48 @@ impl Datasource for JetstreamerDatasource {
         )
         .await;
 
-        result.map_err(|(error, _)| {
-            carbon_core::error::Error::FailedToConsumeDatasource(error.to_string())
-        })?;
+        match result {
+            Ok(()) => {
+                JetstreamerDatasource::flush_all_pending_transactions_without_block_time(
+                    id,
+                    sender,
+                    pending_transactions,
+                )
+                .await
+                .map_err(|error| {
+                    carbon_core::error::Error::FailedToConsumeDatasource(error.to_string())
+                })?;
+            }
+            Err((error, _)) => {
+                return Err(carbon_core::error::Error::FailedToConsumeDatasource(
+                    error.to_string(),
+                ));
+            }
+        }
 
         Ok(())
     }
 
     fn update_types(&self) -> Vec<carbon_core::datasource::UpdateType> {
-        vec![UpdateType::Transaction]
+        let mut update_types = Vec::new();
+        if self.filter.include_transactions {
+            update_types.push(UpdateType::Transaction);
+        }
+        if self.filter.include_blocks {
+            update_types.push(UpdateType::BlockDetails);
+        }
+        update_types
     }
 }
 
 impl JetstreamerDatasource {
     pub async fn on_block(
+        thread_id: usize,
         block: BlockData,
         id: DatasourceId,
         sender: tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
+        pending_transactions: PendingTransactions,
+        emit_block_details: bool,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let BlockData::Block {
             parent_blockhash,
@@ -206,45 +304,66 @@ impl JetstreamerDatasource {
             ..
         } = block
         else {
+            let key = (thread_id, block.slot());
+            Self::flush_pending_transactions(pending_transactions, key, id, sender, false, |_| {})
+                .await?;
             return Ok(());
         };
 
-        sender
-            .send((
-                Update::BlockDetails(BlockDetails {
-                    slot,
-                    block_hash: Some(blockhash),
-                    previous_block_hash: Some(parent_blockhash),
-                    rewards: Some(
-                        rewards
-                            .keyed_rewards
-                            .iter()
-                            .map(|(pubkey, reward)| Reward {
-                                pubkey: pubkey.to_string(),
-                                lamports: reward.lamports,
-                                post_balance: reward.post_balance,
-                                reward_type: Some(reward.reward_type),
-                                commission: reward.commission,
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
-                    num_reward_partitions: rewards.num_partitions,
-                    block_time,
-                    block_height,
-                }),
-                id,
-            ))
-            .await?;
+        let key = (thread_id, slot);
+        let transaction_blockhash = blockhash;
+        Self::flush_pending_transactions(
+            pending_transactions,
+            key,
+            id.clone(),
+            sender.clone(),
+            block_time.is_some(),
+            move |transaction| {
+                transaction.block_time = block_time;
+                transaction.block_hash = Some(transaction_blockhash);
+            },
+        )
+        .await?;
 
-        BLOCKS_SENT.inc();
+        if emit_block_details {
+            sender
+                .send((
+                    Update::BlockDetails(BlockDetails {
+                        slot,
+                        block_hash: Some(blockhash),
+                        previous_block_hash: Some(parent_blockhash),
+                        rewards: Some(
+                            rewards
+                                .keyed_rewards
+                                .iter()
+                                .map(|(pubkey, reward)| Reward {
+                                    pubkey: pubkey.to_string(),
+                                    lamports: reward.lamports,
+                                    post_balance: reward.post_balance,
+                                    reward_type: Some(reward.reward_type),
+                                    commission: reward.commission,
+                                })
+                                .collect::<Vec<_>>(),
+                        ),
+                        num_reward_partitions: rewards.num_partitions,
+                        block_time,
+                        block_height,
+                    }),
+                    id,
+                ))
+                .await?;
+
+            BLOCKS_SENT.inc();
+        }
+
         Ok(())
     }
 
     pub async fn on_transaction(
+        thread_id: usize,
         transaction: TransactionData,
-        id: DatasourceId,
-        sender: tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
         transaction_filters: Vec<TransactionFilter>,
+        pending_transactions: PendingTransactions,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !transaction_filters.is_empty() {
             let mut accounts = HashSet::new();
@@ -278,30 +397,150 @@ impl JetstreamerDatasource {
 
         TRANSACTIONS_FILTERED_IN.inc();
 
-        sender
-            .send((
-                Update::Transaction(Box::new(TransactionUpdate {
-                    signature: transaction.signature,
-                    transaction: transaction.transaction,
-                    meta: transaction.transaction_status_meta,
-                    is_vote: transaction.is_vote,
-                    slot: transaction.slot,
-                    index: Some(transaction.transaction_slot_index as u64),
-                    block_time: None,
-                    block_hash: None,
-                })),
-                id,
-            ))
-            .await?;
+        let update = TransactionUpdate {
+            signature: transaction.signature,
+            transaction: transaction.transaction,
+            meta: transaction.transaction_status_meta,
+            is_vote: transaction.is_vote,
+            slot: transaction.slot,
+            index: Some(transaction.transaction_slot_index as u64),
+            block_time: None,
+            block_hash: None,
+        };
 
-        TRANSACTIONS_SENT.inc();
+        pending_transactions
+            .lock()
+            .await
+            .entry((thread_id, update.slot))
+            .or_default()
+            .push(update);
+
+        TRANSACTIONS_BUFFERED_FOR_BLOCK_TIME.inc();
         Ok(())
+    }
+
+    async fn flush_pending_transactions<F>(
+        pending_transactions: PendingTransactions,
+        key: PendingTransactionKey,
+        id: DatasourceId,
+        sender: tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
+        has_block_time: bool,
+        mut apply_metadata: F,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>>
+    where
+        F: FnMut(&mut TransactionUpdate),
+    {
+        let mut transactions = {
+            let mut pending_transactions = pending_transactions.lock().await;
+            pending_transactions.remove(&key).unwrap_or_default()
+        };
+        let count = transactions.len();
+
+        if count == 0 {
+            return Ok(0);
+        }
+
+        for transaction in &mut transactions {
+            apply_metadata(transaction);
+        }
+
+        for transaction in transactions {
+            sender
+                .send((Update::Transaction(Box::new(transaction)), id.clone()))
+                .await?;
+        }
+
+        TRANSACTIONS_SENT.inc_by(count as u64);
+        if has_block_time {
+            TRANSACTIONS_SENT_WITH_BLOCK_TIME.inc_by(count as u64);
+        } else {
+            TRANSACTIONS_SENT_WITHOUT_BLOCK_TIME.inc_by(count as u64);
+        }
+
+        Ok(count)
+    }
+
+    async fn flush_all_pending_transactions_without_block_time(
+        id: DatasourceId,
+        sender: tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
+        pending_transactions: PendingTransactions,
+    ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+        let keys: Vec<PendingTransactionKey> = {
+            let pending_transactions = pending_transactions.lock().await;
+            pending_transactions.keys().copied().collect()
+        };
+        let mut flushed = 0;
+
+        for key in keys {
+            flushed += Self::flush_pending_transactions(
+                pending_transactions.clone(),
+                key,
+                id.clone(),
+                sender.clone(),
+                false,
+                |_| {},
+            )
+            .await?;
+        }
+
+        Ok(flushed)
     }
 
     pub async fn on_stats(stats: Stats) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         INTERNAL_SLOTS_PROCESSED.set(stats.slots_processed as f64);
         INTERNAL_BLOCKS_PROCESSED.set(stats.blocks_processed as f64);
         INTERNAL_TRANSACTIONS_PROCESSED.set(stats.transactions_processed as f64);
+        let previous_high_watermark = INTERNAL_SLOT_HIGH_WATERMARK.get().max(0.0) as u64;
+        INTERNAL_SLOT_HIGH_WATERMARK
+            .set(previous_high_watermark.max(stats.thread_stats.current_slot) as f64);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filter::JetstreamerFilter;
+    use crate::range::JetstreamerRange;
+
+    #[test]
+    fn transaction_stream_requests_block_callbacks_for_metadata() {
+        assert!(should_request_blocks(true, false));
+        assert!(should_request_blocks(false, true));
+        assert!(should_request_blocks(true, true));
+        assert!(!should_request_blocks(false, false));
+    }
+
+    #[test]
+    fn update_types_only_advertise_publicly_emitted_updates() {
+        let transaction_only = JetstreamerDatasource::new_with_old_faithful_mainnet(
+            JetstreamerRange::Slot(1, 2),
+            JetstreamerFilter {
+                include_transactions: true,
+                include_blocks: false,
+                transaction_filters: Vec::new(),
+            },
+            1,
+            None,
+        );
+        assert_eq!(
+            transaction_only.update_types(),
+            vec![UpdateType::Transaction]
+        );
+
+        let transactions_and_blocks = JetstreamerDatasource::new_with_old_faithful_mainnet(
+            JetstreamerRange::Slot(1, 2),
+            JetstreamerFilter {
+                include_transactions: true,
+                include_blocks: true,
+                transaction_filters: Vec::new(),
+            },
+            1,
+            None,
+        );
+        assert_eq!(
+            transactions_and_blocks.update_types(),
+            vec![UpdateType::Transaction, UpdateType::BlockDetails]
+        );
     }
 }

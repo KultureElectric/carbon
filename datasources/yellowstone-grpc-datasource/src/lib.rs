@@ -16,6 +16,7 @@ use {
     std::{
         collections::{HashMap, HashSet},
         convert::TryFrom,
+        env,
         sync::{Arc, LazyLock},
         time::Duration,
     },
@@ -27,10 +28,16 @@ use {
         geyser::{
             subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
             SubscribeRequestFilterAccounts, SubscribeRequestFilterBlocks,
-            SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdateAccountInfo,
-            SubscribeUpdateTransactionInfo,
+            SubscribeRequestFilterTransactions, SubscribeRequestPing, SubscribeUpdate,
+            SubscribeUpdateAccountInfo, SubscribeUpdateTransactionInfo,
         },
-        tonic::{codec::CompressionEncoding, transport::ClientTlsConfig},
+        prost::Message,
+        tonic::{
+            codec::{CompressionEncoding, Streaming},
+            metadata::AsciiMetadataValue,
+            transport::ClientTlsConfig,
+            Request,
+        },
     },
 };
 
@@ -72,6 +79,36 @@ static TRANSACTION_UPDATES_RECEIVED: Counter = Counter::new(
     "yellowstone_grpc_transaction_updates_received_total",
     "Total transaction updates received from Yellowstone gRPC",
 );
+static ACCOUNT_INTERARRIVAL_US: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::new(
+        "yellowstone_grpc_account_interarrival_us",
+        "Inter-arrival time between account updates in microseconds",
+        vec![10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0],
+    )
+});
+static INTRA_SLOT_INTERARRIVAL_US: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::new(
+        "yellowstone_grpc_intra_slot_interarrival_us",
+        "Inter-arrival time between account updates in the same slot in microseconds",
+        vec![10.0, 50.0, 100.0, 500.0, 1_000.0, 5_000.0, 10_000.0],
+    )
+});
+static SLOT_SPAN_US: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::new(
+        "yellowstone_grpc_slot_span_us",
+        "Time from first to last account update in a slot in microseconds",
+        vec![
+            100.0, 500.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0, 100_000.0,
+        ],
+    )
+});
+static SLOT_UPDATE_COUNT: LazyLock<Histogram> = LazyLock::new(|| {
+    Histogram::new(
+        "yellowstone_grpc_slot_update_count",
+        "Account update count observed per slot",
+        vec![1.0, 10.0, 100.0, 1_000.0, 5_000.0, 10_000.0, 50_000.0],
+    )
+});
 
 fn register_yellowstone_metrics() {
     let registry = MetricsRegistry::global();
@@ -79,10 +116,117 @@ fn register_yellowstone_metrics() {
     registry.register_counter(&TRANSACTION_UPDATES_RECEIVED);
     registry.register_histogram(&ACCOUNT_PROCESS_TIME_NANOS);
     registry.register_histogram(&TRANSACTION_PROCESS_TIME_NANOS);
+    registry.register_histogram(&ACCOUNT_INTERARRIVAL_US);
+    registry.register_histogram(&INTRA_SLOT_INTERARRIVAL_US);
+    registry.register_histogram(&SLOT_SPAN_US);
+    registry.register_histogram(&SLOT_UPDATE_COUNT);
 }
 
 /// Default timeout for detecting stale connections (30 seconds)
 pub const DEFAULT_STREAM_TIMEOUT_SECS: u64 = 30;
+const DEFAULT_METRICS_SERVICE: &str = "unknown";
+const DEFAULT_METRICS_REGION: &str = "unknown";
+const DEFAULT_METRICS_SOURCE: &str = "yellowstone-grpc";
+const DEFAULT_METRICS_SUBSCRIPTION: &str = "default";
+const MAX_METRICS_LABEL_LEN: usize = 96;
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub struct YellowstoneGrpcSubscriptionMetricsLabels {
+    pub service: String,
+    pub region: String,
+    pub source: String,
+    pub subscription: String,
+}
+
+impl YellowstoneGrpcSubscriptionMetricsLabels {
+    pub fn new(
+        service: impl Into<String>,
+        region: impl Into<String>,
+        source: impl Into<String>,
+        subscription: impl Into<String>,
+    ) -> Self {
+        Self {
+            service: sanitize_metric_label(service, DEFAULT_METRICS_SERVICE),
+            region: sanitize_metric_label(region, DEFAULT_METRICS_REGION),
+            source: sanitize_metric_label(source, DEFAULT_METRICS_SOURCE),
+            subscription: sanitize_metric_label(subscription, DEFAULT_METRICS_SUBSCRIPTION),
+        }
+    }
+
+    fn sanitized(self) -> Self {
+        Self::new(self.service, self.region, self.source, self.subscription)
+    }
+}
+
+impl Default for YellowstoneGrpcSubscriptionMetricsLabels {
+    fn default() -> Self {
+        Self::new(
+            first_env_label(&["SERVICE_NAME", "OTEL_SERVICE_NAME", "K_SERVICE"]),
+            first_env_label(&["REGION", "GCP_REGION", "AWS_REGION"]),
+            first_env_label(&["YELLOWSTONE_SOURCE_NAME", "GEYSER_SOURCE_NAME"]),
+            first_env_label(&["YELLOWSTONE_SUBSCRIPTION_NAME", "GEYSER_SUBSCRIPTION_NAME"]),
+        )
+    }
+}
+
+fn first_env_label(names: &[&str]) -> String {
+    names
+        .iter()
+        .find_map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()))
+        .unwrap_or_default()
+}
+
+fn sanitize_metric_label(value: impl Into<String>, default: &str) -> String {
+    let mut sanitized = String::with_capacity(MAX_METRICS_LABEL_LEN);
+    for ch in value.into().trim().chars().take(MAX_METRICS_LABEL_LEN) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | ':') {
+            sanitized.push(ch);
+        } else {
+            sanitized.push('_');
+        }
+    }
+
+    if sanitized.is_empty() {
+        default.to_string()
+    } else {
+        sanitized
+    }
+}
+
+async fn subscribe_with_subscription_id(
+    geyser_client: &mut GeyserGrpcClient,
+    subscribe_request: SubscribeRequest,
+    subscription_id: &str,
+) -> Result<
+    (
+        futures::channel::mpsc::UnboundedSender<SubscribeRequest>,
+        Streaming<SubscribeUpdate>,
+    ),
+    String,
+> {
+    let (mut subscribe_tx, subscribe_rx) = futures::channel::mpsc::unbounded();
+    subscribe_tx
+        .send(subscribe_request)
+        .await
+        .map_err(|error| format!("failed to send initial subscribe request: {error}"))?;
+
+    let mut request = Request::new(subscribe_rx);
+    let subscription_id = sanitize_metric_label(subscription_id, DEFAULT_METRICS_SUBSCRIPTION);
+    let subscription_id = subscription_id
+        .parse::<AsciiMetadataValue>()
+        .map_err(|error| format!("invalid x-subscription-id metadata value: {error}"))?;
+    request
+        .metadata_mut()
+        .insert("x-subscription-id", subscription_id);
+
+    geyser_client
+        .geyser
+        .subscribe(request)
+        .await
+        .map(|response| response.into_inner())
+        .map(|stream| (subscribe_tx, stream))
+        .map_err(|error| error.to_string())
+}
 
 #[derive(Debug)]
 pub struct YellowstoneGrpcGeyserClient {
@@ -97,6 +241,7 @@ pub struct YellowstoneGrpcGeyserClient {
     pub disconnect_notifier: Option<mpsc::Sender<DatasourceDisconnection>>,
     /// Timeout for detecting hung/stale connections. Default: 30 seconds.
     pub stream_timeout: Duration,
+    pub metrics_labels: YellowstoneGrpcSubscriptionMetricsLabels,
 }
 
 #[derive(Debug, Clone)]
@@ -156,7 +301,13 @@ impl YellowstoneGrpcGeyserClient {
             disconnect_notifier,
             stream_timeout: stream_timeout
                 .unwrap_or(Duration::from_secs(DEFAULT_STREAM_TIMEOUT_SECS)),
+            metrics_labels: YellowstoneGrpcSubscriptionMetricsLabels::default(),
         }
+    }
+
+    pub fn with_metrics_labels(mut self, labels: YellowstoneGrpcSubscriptionMetricsLabels) -> Self {
+        self.metrics_labels = labels.sanitized();
+        self
     }
 }
 
@@ -208,6 +359,189 @@ impl YellowstoneGrpcClientConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum YellowstoneGrpcUpdateType {
+    Account,
+    Slot,
+    Transaction,
+    TransactionStatus,
+    Block,
+    Ping,
+    Pong,
+    BlockMeta,
+    Entry,
+    Other,
+}
+
+impl YellowstoneGrpcUpdateType {
+    fn from_update(update: &Option<UpdateOneof>) -> Self {
+        match update {
+            Some(UpdateOneof::Account(_)) => Self::Account,
+            Some(UpdateOneof::Slot(_)) => Self::Slot,
+            Some(UpdateOneof::Transaction(_)) => Self::Transaction,
+            Some(UpdateOneof::TransactionStatus(_)) => Self::TransactionStatus,
+            Some(UpdateOneof::Block(_)) => Self::Block,
+            Some(UpdateOneof::Ping(_)) => Self::Ping,
+            Some(UpdateOneof::Pong(_)) => Self::Pong,
+            Some(UpdateOneof::BlockMeta(_)) => Self::BlockMeta,
+            Some(UpdateOneof::Entry(_)) => Self::Entry,
+            None => Self::Other,
+        }
+    }
+
+    fn as_label(self) -> &'static str {
+        match self {
+            Self::Account => "account",
+            Self::Slot => "slot",
+            Self::Transaction => "transaction",
+            Self::TransactionStatus => "transaction_status",
+            Self::Block => "block",
+            Self::Ping => "ping",
+            Self::Pong => "pong",
+            Self::BlockMeta => "block_meta",
+            Self::Entry => "entry",
+            Self::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct YellowstoneGrpcUpdateMetricHandles {
+    bytes: metrics::Counter,
+    messages: metrics::Counter,
+    message_bytes: metrics::Histogram,
+}
+
+impl YellowstoneGrpcUpdateMetricHandles {
+    fn new(
+        labels: &YellowstoneGrpcSubscriptionMetricsLabels,
+        update_type: YellowstoneGrpcUpdateType,
+    ) -> Self {
+        let metric_labels = ingress_update_metric_labels(labels, update_type.as_label());
+
+        Self {
+            bytes: metrics::counter!(
+                "yellowstone_grpc_ingress_bytes_total",
+                metric_labels.clone()
+            ),
+            messages: metrics::counter!(
+                "yellowstone_grpc_ingress_messages_total",
+                metric_labels.clone()
+            ),
+            message_bytes: metrics::histogram!(
+                "yellowstone_grpc_ingress_message_bytes",
+                metric_labels
+            ),
+        }
+    }
+
+    fn record(&self, encoded_len: usize) {
+        self.bytes.increment(encoded_len as u64);
+        self.messages.increment(1);
+        self.message_bytes.record(encoded_len as f64);
+    }
+}
+
+#[derive(Debug, Clone)]
+struct YellowstoneGrpcIngressMetricHandles {
+    connected: metrics::Gauge,
+    account: YellowstoneGrpcUpdateMetricHandles,
+    slot: YellowstoneGrpcUpdateMetricHandles,
+    transaction: YellowstoneGrpcUpdateMetricHandles,
+    transaction_status: YellowstoneGrpcUpdateMetricHandles,
+    block: YellowstoneGrpcUpdateMetricHandles,
+    ping: YellowstoneGrpcUpdateMetricHandles,
+    pong: YellowstoneGrpcUpdateMetricHandles,
+    block_meta: YellowstoneGrpcUpdateMetricHandles,
+    entry: YellowstoneGrpcUpdateMetricHandles,
+    other: YellowstoneGrpcUpdateMetricHandles,
+}
+
+impl YellowstoneGrpcIngressMetricHandles {
+    fn new(labels: YellowstoneGrpcSubscriptionMetricsLabels) -> Self {
+        let connection_labels = ingress_connection_metric_labels(&labels);
+
+        Self {
+            connected: metrics::gauge!(
+                "yellowstone_grpc_subscription_connected",
+                connection_labels
+            ),
+            account: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::Account,
+            ),
+            slot: YellowstoneGrpcUpdateMetricHandles::new(&labels, YellowstoneGrpcUpdateType::Slot),
+            transaction: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::Transaction,
+            ),
+            transaction_status: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::TransactionStatus,
+            ),
+            block: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::Block,
+            ),
+            ping: YellowstoneGrpcUpdateMetricHandles::new(&labels, YellowstoneGrpcUpdateType::Ping),
+            pong: YellowstoneGrpcUpdateMetricHandles::new(&labels, YellowstoneGrpcUpdateType::Pong),
+            block_meta: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::BlockMeta,
+            ),
+            entry: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::Entry,
+            ),
+            other: YellowstoneGrpcUpdateMetricHandles::new(
+                &labels,
+                YellowstoneGrpcUpdateType::Other,
+            ),
+        }
+    }
+
+    fn set_connected(&self, connected: bool) {
+        self.connected.set(if connected { 1.0 } else { 0.0 });
+    }
+
+    fn record_message(&self, update: &Option<UpdateOneof>, encoded_len: usize) {
+        let handles = match YellowstoneGrpcUpdateType::from_update(update) {
+            YellowstoneGrpcUpdateType::Account => &self.account,
+            YellowstoneGrpcUpdateType::Slot => &self.slot,
+            YellowstoneGrpcUpdateType::Transaction => &self.transaction,
+            YellowstoneGrpcUpdateType::TransactionStatus => &self.transaction_status,
+            YellowstoneGrpcUpdateType::Block => &self.block,
+            YellowstoneGrpcUpdateType::Ping => &self.ping,
+            YellowstoneGrpcUpdateType::Pong => &self.pong,
+            YellowstoneGrpcUpdateType::BlockMeta => &self.block_meta,
+            YellowstoneGrpcUpdateType::Entry => &self.entry,
+            YellowstoneGrpcUpdateType::Other => &self.other,
+        };
+
+        handles.record(encoded_len);
+    }
+}
+
+fn ingress_connection_metric_labels(
+    labels: &YellowstoneGrpcSubscriptionMetricsLabels,
+) -> Vec<metrics::Label> {
+    vec![
+        metrics::Label::new("service", labels.service.clone()),
+        metrics::Label::new("region", labels.region.clone()),
+        metrics::Label::new("source", labels.source.clone()),
+        metrics::Label::new("subscription", labels.subscription.clone()),
+    ]
+}
+
+fn ingress_update_metric_labels(
+    labels: &YellowstoneGrpcSubscriptionMetricsLabels,
+    update_type: &'static str,
+) -> Vec<metrics::Label> {
+    let mut metric_labels = ingress_connection_metric_labels(labels);
+    metric_labels.push(metrics::Label::new("update_type", update_type));
+    metric_labels
+}
+
 #[async_trait]
 impl Datasource for YellowstoneGrpcGeyserClient {
     async fn consume(
@@ -244,6 +578,8 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
         let disconnect_tx_clone = self.disconnect_notifier.clone();
         let stream_timeout = self.stream_timeout;
+        let ingress_metrics = YellowstoneGrpcIngressMetricHandles::new(self.metrics_labels.clone());
+        let subscription_id = self.metrics_labels.subscription.clone();
 
         tokio::spawn(async move {
             let subscribe_request = SubscribeRequest {
@@ -266,15 +602,38 @@ impl Datasource for YellowstoneGrpcGeyserClient {
             let mut last_slot_before_disconnect: Option<u64> = None;
             let mut last_processed_slot: u64 = 0;
 
+            // Inter-arrival timing tracking for account updates (global)
+            let mut last_account_arrival: Option<std::time::Instant> = None;
+            let mut arrival_count: u64 = 0;
+            let mut total_delta_us: u64 = 0;
+            let mut min_delta_us: u64 = u64::MAX;
+            let mut max_delta_us: u64 = 0;
+
+            // Intra-slot timing tracking (per-slot metrics)
+            let mut current_slot: Option<u64> = None;
+            let mut slot_first_arrival: Option<std::time::Instant> = None;
+            let mut slot_last_arrival: Option<std::time::Instant> = None;
+            let mut slot_update_count: u64 = 0;
+
             loop {
                 tokio::select! {
                     _ = cancellation_token.cancelled() => {
                         log::info!("Cancelling Yellowstone gRPC subscription.");
+                        ingress_metrics.set_connected(false);
+                        // Log final arrival stats
+                        if arrival_count > 1 {
+                            let avg_delta_us = total_delta_us / (arrival_count - 1);
+                            log::info!(
+                                "Account arrival stats: count={}, avg_delta={}us, min={}us, max={}us",
+                                arrival_count, avg_delta_us, min_delta_us, max_delta_us
+                            );
+                        }
                         break;
                     }
-                    result = geyser_client.subscribe_with_request(Some(subscribe_request.clone())) => {
+                    result = subscribe_with_subscription_id(&mut geyser_client, subscribe_request.clone(), &subscription_id) => {
                         match result {
                             Ok((mut subscribe_tx, mut stream)) => {
+                                ingress_metrics.set_connected(true);
                                 let mut first_message_after_reconnect = last_disconnect_time.is_some();
 
                                 loop {
@@ -311,6 +670,11 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
                                     match message {
                                         Ok(msg) => {
+                                            ingress_metrics.record_message(
+                                                &msg.update_oneof,
+                                                msg.encoded_len(),
+                                            );
+
                                             if first_message_after_reconnect {
                                                 let current_slot = match &msg.update_oneof {
                                                     Some(UpdateOneof::Account(ref update)) => Some(update.slot),
@@ -346,13 +710,66 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
                                             match msg.update_oneof {
                                             Some(UpdateOneof::Account(account_update)) => {
-                                                last_processed_slot = account_update.slot;
+                                                let arrival_time = std::time::Instant::now();
+                                                let update_slot = account_update.slot;
+                                                last_processed_slot = update_slot;
+
+                                                // Check if slot changed - emit metrics for previous slot
+                                                if let Some(prev_slot) = current_slot {
+                                                    if update_slot != prev_slot {
+                                                        if let (Some(first), Some(last)) = (slot_first_arrival, slot_last_arrival) {
+                                                            let span_us = last.duration_since(first).as_micros() as u64;
+                                                            SLOT_SPAN_US.record(span_us as f64);
+                                                        }
+                                                        SLOT_UPDATE_COUNT.record(slot_update_count as f64);
+
+                                                        // Reset for new slot
+                                                        slot_first_arrival = Some(arrival_time);
+                                                        slot_last_arrival = Some(arrival_time);
+                                                        slot_update_count = 1;
+                                                        current_slot = Some(update_slot);
+                                                    } else {
+                                                        // Same slot - track intra-slot inter-arrival
+                                                        if let Some(last_slot_arrival) = slot_last_arrival {
+                                                            let intra_delta_us = arrival_time.duration_since(last_slot_arrival).as_micros() as u64;
+                                                            INTRA_SLOT_INTERARRIVAL_US.record(intra_delta_us as f64);
+                                                        }
+                                                        slot_last_arrival = Some(arrival_time);
+                                                        slot_update_count += 1;
+                                                    }
+                                                } else {
+                                                    current_slot = Some(update_slot);
+                                                    slot_first_arrival = Some(arrival_time);
+                                                    slot_last_arrival = Some(arrival_time);
+                                                    slot_update_count = 1;
+                                                }
+
+                                                // Track global inter-arrival timing
+                                                if let Some(last_arrival) = last_account_arrival {
+                                                    let delta_us = arrival_time.duration_since(last_arrival).as_micros() as u64;
+                                                    total_delta_us += delta_us;
+                                                    min_delta_us = min_delta_us.min(delta_us);
+                                                    max_delta_us = max_delta_us.max(delta_us);
+                                                    ACCOUNT_INTERARRIVAL_US.record(delta_us as f64);
+                                                }
+                                                last_account_arrival = Some(arrival_time);
+                                                arrival_count += 1;
+
+                                                if arrival_count > 1 && arrival_count % 5000 == 0 {
+                                                    let avg_delta_us = total_delta_us / (arrival_count - 1);
+                                                    log::info!(
+                                                        "Account arrival stats (slot {}): count={}, avg_delta={}us, min={}us, max={}us",
+                                                        update_slot, arrival_count, avg_delta_us, min_delta_us, max_delta_us
+                                                    );
+                                                }
+
                                                 send_subscribe_account_update_info(
                                                     account_update.account,
                                                     &sender,
                                                     id_for_loop.clone(),
-                                                    account_update.slot,
+                                                    update_slot,
                                                     &account_deletions_tracked,
+                                                    &cancellation_token,
                                                 )
                                                 .await
                                             }
@@ -365,6 +782,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                     id_for_loop.clone(),
                                                     transaction_update.slot,
                                                     None,
+                                                    &cancellation_token,
                                                 )
                                                 .await
                                             }
@@ -374,7 +792,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
 
                                                 for transaction_update in block_update.transactions {
                                                     if retain_block_failed_transactions || transaction_update.meta.as_ref().map(|meta| meta.err.is_none()).unwrap_or(false) {
-                                                        send_subscribe_update_transaction_info(Some(transaction_update), &sender, id_for_loop.clone(), block_update.slot, block_time).await
+                                                        send_subscribe_update_transaction_info(Some(transaction_update), &sender, id_for_loop.clone(), block_update.slot, block_time, &cancellation_token).await
                                                     }
                                                 }
 
@@ -385,6 +803,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                         id_for_loop.clone(),
                                                         block_update.slot,
                                                         &account_deletions_tracked,
+                                                        &cancellation_token,
                                                     )
                                                     .await;
                                                 }
@@ -421,9 +840,11 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                         }
                                     }
                                 }
+                                ingress_metrics.set_connected(false);
                             }
                             Err(e) => {
                                 log::error!("Failed to subscribe: {e:?}");
+                                ingress_metrics.set_connected(false);
 
                                 if last_disconnect_time.is_none() {
                                     last_disconnect_time = Some(Utc::now());
@@ -455,6 +876,7 @@ async fn send_subscribe_account_update_info(
     id: DatasourceId,
     slot: u64,
     account_deletions_tracked: &RwLock<HashSet<Pubkey>>,
+    cancellation_token: &CancellationToken,
 ) {
     let start_time = std::time::Instant::now();
 
@@ -489,9 +911,15 @@ async fn send_subscribe_account_update_info(
                         .and_then(|sig| Signature::try_from(sig).ok()),
                 };
                 if let Err(e) = sender.try_send((Update::AccountDeletion(account_deletion), id)) {
-                    log::error!(
-                        "Failed to send account deletion update for pubkey {account_pubkey:?} at slot {slot}: {e:?}"
-                    );
+                    if expected_closed_send_after_cancellation(&e, cancellation_token) {
+                        log::debug!(
+                            "Account deletion output closed after datasource cancellation for pubkey {account_pubkey:?} at slot {slot}"
+                        );
+                    } else {
+                        log::error!(
+                            "Failed to send account deletion update for pubkey {account_pubkey:?} at slot {slot}: {e:?}"
+                        );
+                    }
                 }
             }
         } else {
@@ -502,12 +930,19 @@ async fn send_subscribe_account_update_info(
                 transaction_signature: account_info
                     .txn_signature
                     .and_then(|sig| Signature::try_from(sig).ok()),
+                write_version: Some(account_info.write_version),
             });
 
             if let Err(e) = sender.try_send((update, id)) {
-                log::error!(
-                    "Failed to send account update for pubkey {account_pubkey:?} at slot {slot}: {e:?}"
-                );
+                if expected_closed_send_after_cancellation(&e, cancellation_token) {
+                    log::debug!(
+                        "Account output closed after datasource cancellation for pubkey {account_pubkey:?} at slot {slot}"
+                    );
+                } else {
+                    log::error!(
+                        "Failed to send account update for pubkey {account_pubkey:?} at slot {slot}: {e:?}"
+                    );
+                }
             }
         }
 
@@ -524,6 +959,7 @@ async fn send_subscribe_update_transaction_info(
     id: DatasourceId,
     slot: u64,
     block_time: Option<i64>,
+    cancellation_token: &CancellationToken,
 ) {
     let start_time = std::time::Instant::now();
 
@@ -558,9 +994,15 @@ async fn send_subscribe_update_transaction_info(
             block_hash: None,
         }));
         if let Err(e) = sender.try_send((update, id)) {
-            log::error!(
-                "Failed to send transaction update with signature {signature:?} at slot {slot}: {e:?}"
-            );
+            if expected_closed_send_after_cancellation(&e, cancellation_token) {
+                log::debug!(
+                    "Transaction output closed after datasource cancellation for signature {signature:?} at slot {slot}"
+                );
+            } else {
+                log::error!(
+                    "Failed to send transaction update with signature {signature:?} at slot {slot}: {e:?}"
+                );
+            }
             return;
         }
 
@@ -568,5 +1010,36 @@ async fn send_subscribe_update_transaction_info(
         TRANSACTION_UPDATES_RECEIVED.inc();
     } else {
         log::error!("No transaction info in `UpdateOneof::Transaction` at slot {slot}");
+    }
+}
+
+fn expected_closed_send_after_cancellation<T>(
+    error: &mpsc::error::TrySendError<T>,
+    cancellation_token: &CancellationToken,
+) -> bool {
+    cancellation_token.is_cancelled() && matches!(error, mpsc::error::TrySendError::Closed(_))
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[test]
+    fn only_closed_send_after_owned_cancellation_is_expected() {
+        let token = CancellationToken::new();
+        let (sender, receiver) = mpsc::channel::<u8>(1);
+
+        sender.try_send(1).unwrap();
+        let full = sender.try_send(2).unwrap_err();
+        assert!(!expected_closed_send_after_cancellation(&full, &token));
+        token.cancel();
+        assert!(!expected_closed_send_after_cancellation(&full, &token));
+
+        drop(receiver);
+        let closed = sender.try_send(3).unwrap_err();
+        assert!(expected_closed_send_after_cancellation(&closed, &token));
+
+        let active = CancellationToken::new();
+        assert!(!expected_closed_send_after_cancellation(&closed, &active));
     }
 }

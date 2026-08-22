@@ -36,6 +36,7 @@ pub fn create_message(message: &VersionedMessage) -> proto::Message {
             instructions: create_instructions(&message.instructions),
             versioned: false,
             address_table_lookups: vec![],
+            config: None,
         },
         VersionedMessage::V0(message) => proto::Message {
             header: Some(create_header(&message.header)),
@@ -44,6 +45,7 @@ pub fn create_message(message: &VersionedMessage) -> proto::Message {
             instructions: create_instructions(&message.instructions),
             versioned: true,
             address_table_lookups: create_lookups(&message.address_table_lookups),
+            config: None,
         },
         VersionedMessage::V1(_) => panic!("v1 transactions not supported"),
     }
@@ -233,7 +235,79 @@ pub const fn create_reward_type(reward_type: Option<RewardType>) -> proto::Rewar
         Some(RewardType::Rent) => proto::RewardType::Rent,
         Some(RewardType::Staking) => proto::RewardType::Staking,
         Some(RewardType::Voting) => proto::RewardType::Voting,
-        Some(RewardType::DeactivatedStake) => proto::RewardType::Staking,
+        Some(RewardType::DeactivatedStake) => proto::RewardType::DeactivatedStake,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*,
+        crate::convert_from,
+        solana_hash::Hash,
+        solana_message::{
+            v0::{Message as MessageV0, MessageAddressTableLookup},
+            Message as LegacyMessage,
+        },
+    };
+
+    fn header() -> MessageHeader {
+        MessageHeader {
+            num_required_signatures: 1,
+            num_readonly_signed_accounts: 0,
+            num_readonly_unsigned_accounts: 1,
+        }
+    }
+
+    fn instruction() -> CompiledInstruction {
+        CompiledInstruction {
+            program_id_index: 1,
+            accounts: vec![0],
+            data: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn legacy_message_round_trips_without_version_metadata() {
+        let message = VersionedMessage::Legacy(LegacyMessage {
+            header: header(),
+            account_keys: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            recent_blockhash: Hash::new_from_array([7; 32]),
+            instructions: vec![instruction()],
+        });
+
+        let encoded = create_message(&message);
+        assert!(!encoded.versioned);
+        assert!(encoded.address_table_lookups.is_empty());
+        assert!(encoded.config.is_none());
+        assert_eq!(convert_from::create_message(encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn v0_message_with_lookup_table_round_trips_without_v1_config() {
+        let message = VersionedMessage::V0(MessageV0 {
+            header: header(),
+            account_keys: vec![Pubkey::new_unique(), Pubkey::new_unique()],
+            recent_blockhash: Hash::new_from_array([9; 32]),
+            instructions: vec![instruction()],
+            address_table_lookups: vec![MessageAddressTableLookup {
+                account_key: Pubkey::new_unique(),
+                writable_indexes: vec![0, 2],
+                readonly_indexes: vec![1],
+            }],
+        });
+
+        let encoded = create_message(&message);
+        assert!(encoded.versioned);
+        assert_eq!(encoded.address_table_lookups.len(), 1);
+        assert!(encoded.config.is_none());
+        assert_eq!(convert_from::create_message(encoded).unwrap(), message);
+    }
+
+    #[test]
+    fn deactivated_stake_reward_type_round_trips_without_downgrade() {
+        let encoded = create_reward_type(Some(RewardType::DeactivatedStake));
+        assert_eq!(encoded, proto::RewardType::DeactivatedStake);
     }
 }
 

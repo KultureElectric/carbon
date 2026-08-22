@@ -26,6 +26,7 @@ async-trait = { workspace = true }
 chrono = { workspace = true }
 futures = { workspace = true }
 log = { workspace = true }
+metrics = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-util = { workspace = true }
 yellowstone-grpc-client = { workspace = true }

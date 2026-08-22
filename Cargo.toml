@@ -207,6 +207,6 @@ tonic = { version = "0.13.1", features = ["tls-native-roots", "tls-webpki-roots"
 tonic-build = "0.13.1"
 unicode-xid = "0.2"
 uuid = { version = "1.18.1", features = ["serde", "v7"] }
-yellowstone-grpc-client = { version = "13.2.0" }
+yellowstone-grpc-client = { version = "=13.3.0" }
 yellowstone-grpc-convert = { path = "crates/yellowstone-grpc-convert" }
-yellowstone-grpc-proto = { version = "12.5.0" }
+yellowstone-grpc-proto = { version = "=12.6.0" }
