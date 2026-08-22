@@ -4,7 +4,9 @@ members = ["crates/*", "datasources/*", "decoders/*", "examples/*", "metrics/*"]
 exclude = [
     "datasources/helius-atlas-ws-datasource",
     "datasources/jetstreamer-datasource",
+    "datasources/validator-snapshot-datasource",
     "examples/jetstreamer",
+    "examples/snapshot-validator",
 ]
 resolver = "2"
 
