@@ -706,6 +706,25 @@ impl YellowstoneGrpcIngressMetricHandles {
         labels.push(metrics::Label::new("reason", rejection.metric_label()));
         metrics::counter!("yellowstone_grpc_transaction_rejections_total", labels).increment(1);
     }
+
+    fn record_authoritative_output_failure(&self, error: &AuthoritativeOutputError) {
+        metrics::counter!(
+            "yellowstone_grpc_authoritative_output_failures_total",
+            authoritative_output_failure_metric_labels(&self.labels, error)
+        )
+        .increment(1);
+    }
+}
+
+fn authoritative_output_failure_metric_labels(
+    labels: &YellowstoneGrpcSubscriptionMetricsLabels,
+    error: &AuthoritativeOutputError,
+) -> Vec<metrics::Label> {
+    let (state, update_type) = error.metric_labels();
+    let mut metric_labels = ingress_connection_metric_labels(labels);
+    metric_labels.push(metrics::Label::new("state", state));
+    metric_labels.push(metrics::Label::new("update_type", update_type));
+    metric_labels
 }
 
 fn ingress_connection_metric_labels(
@@ -962,6 +981,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                         &mut last_disconnect_time,
                                                         &mut last_slot_before_disconnect,
                                                         last_processed_slot,
+                                                        &ingress_metrics,
                                                     );
                                                     break 'stream_generation;
                                                 }
@@ -984,6 +1004,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                         &mut last_disconnect_time,
                                                         &mut last_slot_before_disconnect,
                                                         last_processed_slot,
+                                                        &ingress_metrics,
                                                     );
                                                     break 'stream_generation;
                                                 }
@@ -1000,6 +1021,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                                 &mut last_disconnect_time,
                                                                 &mut last_slot_before_disconnect,
                                                                 last_processed_slot,
+                                                                &ingress_metrics,
                                                             );
                                                             break 'stream_generation;
                                                         }
@@ -1020,6 +1042,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                             &mut last_disconnect_time,
                                                             &mut last_slot_before_disconnect,
                                                             last_processed_slot,
+                                                            &ingress_metrics,
                                                         );
                                                         break 'stream_generation;
                                                     }
@@ -1214,6 +1237,22 @@ enum AuthoritativeOutputError {
     Closed { update_type: UpdateType, slot: u64 },
 }
 
+impl AuthoritativeOutputError {
+    fn metric_labels(&self) -> (&'static str, &'static str) {
+        let (state, update_type) = match self {
+            Self::Full { update_type, .. } => ("full", update_type),
+            Self::Closed { update_type, .. } => ("closed", update_type),
+        };
+        let update_type = match update_type {
+            UpdateType::AccountUpdate => "account_update",
+            UpdateType::Transaction => "transaction",
+            UpdateType::AccountDeletion => "account_deletion",
+            UpdateType::BlockDetails => "block_details",
+        };
+        (state, update_type)
+    }
+}
+
 impl fmt::Display for AuthoritativeOutputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (state, update_type, slot) = match self {
@@ -1257,7 +1296,9 @@ fn record_authoritative_output_failure(
     last_disconnect_time: &mut Option<DateTime<Utc>>,
     last_slot_before_disconnect: &mut Option<u64>,
     last_processed_slot: u64,
+    ingress_metrics: &YellowstoneGrpcIngressMetricHandles,
 ) {
+    ingress_metrics.record_authoritative_output_failure(error);
     log::error!("{error}; invalidating Yellowstone stream generation for reconnect");
     if last_disconnect_time.is_none() {
         *last_disconnect_time = Some(Utc::now());
@@ -1474,6 +1515,66 @@ mod cancellation_tests {
 
         let rejection = convert_transaction_update(transaction_info, 500, None).unwrap_err();
         assert_eq!(rejection.metric_label(), "invalid_v1_message");
+    }
+
+    #[test]
+    fn authoritative_output_failure_metrics_use_only_closed_labels() {
+        let cases = [
+            (
+                AuthoritativeOutputError::Full {
+                    update_type: UpdateType::AccountUpdate,
+                    slot: 1,
+                },
+                ("full", "account_update"),
+            ),
+            (
+                AuthoritativeOutputError::Full {
+                    update_type: UpdateType::Transaction,
+                    slot: 2,
+                },
+                ("full", "transaction"),
+            ),
+            (
+                AuthoritativeOutputError::Closed {
+                    update_type: UpdateType::AccountDeletion,
+                    slot: 3,
+                },
+                ("closed", "account_deletion"),
+            ),
+            (
+                AuthoritativeOutputError::Closed {
+                    update_type: UpdateType::BlockDetails,
+                    slot: 4,
+                },
+                ("closed", "block_details"),
+            ),
+        ];
+
+        for (error, expected) in cases {
+            assert_eq!(error.metric_labels(), expected);
+        }
+
+        let connection = YellowstoneGrpcSubscriptionMetricsLabels::new(
+            "edge-indexer",
+            "fra",
+            "yellowstone",
+            "accounts-and-transactions",
+        );
+        let error = AuthoritativeOutputError::Full {
+            update_type: UpdateType::Transaction,
+            slot: 5,
+        };
+        assert_eq!(
+            authoritative_output_failure_metric_labels(&connection, &error),
+            vec![
+                metrics::Label::new("service", "edge-indexer"),
+                metrics::Label::new("region", "fra"),
+                metrics::Label::new("source", "yellowstone"),
+                metrics::Label::new("subscription", "accounts-and-transactions"),
+                metrics::Label::new("state", "full"),
+                metrics::Label::new("update_type", "transaction"),
+            ]
+        );
     }
 
     #[test]
