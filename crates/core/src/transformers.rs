@@ -30,7 +30,7 @@ use {
         TransactionStatusMeta, TransactionTokenBalance, UiInstruction, UiLoadedAddresses,
         UiTransactionStatusMeta,
     },
-    std::{collections::HashSet, str::FromStr, sync::Arc},
+    std::{str::FromStr, sync::Arc},
 };
 
 pub fn extract_instructions_with_metadata(
@@ -89,7 +89,17 @@ pub fn extract_instructions_with_metadata(
                 |_, idx| idx < v0.header.num_required_signatures as usize,
             );
         }
-        VersionedMessage::V1(_) => panic!("not supported"),
+        VersionedMessage::V1(v1) => {
+            process_instructions(
+                &v1.account_keys,
+                &v1.instructions,
+                &meta.inner_instructions,
+                transaction_metadata,
+                &mut instructions_with_metadata,
+                |_, idx| v1.is_maybe_writable(idx, None),
+                |_, idx| v1.is_signer(idx),
+            );
+        }
     }
 
     Ok(instructions_with_metadata)
@@ -201,16 +211,7 @@ pub fn extract_account_metas(
                 .get(*account_index as usize)
                 .ok_or(Error::MissingAccountInTransaction)?,
             is_signer: message.is_signer(*account_index as usize),
-            is_writable: message.is_maybe_writable(
-                *account_index as usize,
-                Some(
-                    &message
-                        .static_account_keys()
-                        .iter()
-                        .copied()
-                        .collect::<HashSet<_>>(),
-                ),
-            ),
+            is_writable: message.is_maybe_writable(*account_index as usize, None),
         });
     }
 
@@ -377,12 +378,90 @@ mod tests {
         solana_message::{
             legacy::Message,
             v0::{self, MessageAddressTableLookup},
+            v1::{self, TransactionConfig},
             MessageHeader,
         },
         solana_signature::Signature,
         solana_transaction::versioned::VersionedTransaction,
         std::vec,
     };
+
+    fn v1_boundary_message() -> VersionedMessage {
+        VersionedMessage::V1(v1::Message::new(
+            MessageHeader {
+                num_required_signatures: 3,
+                num_readonly_signed_accounts: 1,
+                num_readonly_unsigned_accounts: 1,
+            },
+            TransactionConfig::empty(),
+            Hash::default(),
+            (0..5).map(|_| Pubkey::new_unique()).collect(),
+            vec![CompiledInstruction {
+                program_id_index: 4,
+                accounts: vec![0, 1, 2, 3],
+                data: vec![10, 20],
+            }],
+        ))
+    }
+
+    #[test]
+    fn v1_account_meta_boundaries_preserve_signer_and_writable_flags() {
+        let message = v1_boundary_message();
+        let instruction = &message.instructions()[0];
+
+        let metas = extract_account_metas(instruction, &message).unwrap();
+
+        assert_eq!(metas.len(), 4);
+        assert_eq!((metas[0].is_signer, metas[0].is_writable), (true, true));
+        assert_eq!((metas[1].is_signer, metas[1].is_writable), (true, true));
+        assert_eq!((metas[2].is_signer, metas[2].is_writable), (true, false));
+        assert_eq!((metas[3].is_signer, metas[3].is_writable), (false, true));
+    }
+
+    #[test]
+    fn v1_instruction_extraction_uses_inline_accounts_and_exact_indices() {
+        let message = v1_boundary_message();
+        let transaction_update = TransactionUpdate {
+            signature: Signature::default(),
+            transaction: VersionedTransaction {
+                signatures: vec![Signature::default(); 3],
+                message: message.clone(),
+            },
+            meta: TransactionStatusMeta::default(),
+            is_vote: false,
+            slot: 42,
+            index: Some(7),
+            block_time: None,
+            block_hash: None,
+        };
+        let metadata = Arc::new(TransactionMetadata {
+            slot: 42,
+            message: message.clone(),
+            ..TransactionMetadata::default()
+        });
+
+        let extracted = extract_instructions_with_metadata(&metadata, &transaction_update).unwrap();
+
+        assert_eq!(extracted.len(), 1);
+        assert_eq!(extracted[0].0.index, 0);
+        assert_eq!(extracted[0].0.absolute_path, vec![0]);
+        assert_eq!(extracted[0].1.program_id, message.static_account_keys()[4]);
+        assert_eq!(extracted[0].1.data, vec![10, 20]);
+        assert_eq!(
+            extracted[0]
+                .1
+                .accounts
+                .iter()
+                .map(|meta| (meta.pubkey, meta.is_signer, meta.is_writable))
+                .collect::<Vec<_>>(),
+            vec![
+                (message.static_account_keys()[0], true, true),
+                (message.static_account_keys()[1], true, true),
+                (message.static_account_keys()[2], true, false),
+                (message.static_account_keys()[3], false, true),
+            ]
+        );
+    }
 
     #[test]
     fn test_transaction_metadata_from_original_meta_simple() {
