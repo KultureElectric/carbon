@@ -23,7 +23,10 @@ use {
     tokio::sync::{mpsc, mpsc::Sender, RwLock},
     tokio_util::sync::CancellationToken,
     yellowstone_grpc_client::{GeyserGrpcBuilder, GeyserGrpcBuilderResult, GeyserGrpcClient},
-    yellowstone_grpc_convert::convert_from::{create_tx_meta, create_tx_versioned},
+    yellowstone_grpc_convert::{
+        convert_from::{create_tx_meta, create_tx_versioned},
+        ConversionError,
+    },
     yellowstone_grpc_proto::{
         geyser::{
             subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
@@ -79,6 +82,10 @@ static TRANSACTION_UPDATES_RECEIVED: Counter = Counter::new(
     "yellowstone_grpc_transaction_updates_received_total",
     "Total transaction updates received from Yellowstone gRPC",
 );
+static TRANSACTION_UPDATES_REJECTED: Counter = Counter::new(
+    "yellowstone_grpc_transaction_updates_rejected_total",
+    "Total malformed transaction updates rejected while keeping the stream alive",
+);
 static ACCOUNT_INTERARRIVAL_US: LazyLock<Histogram> = LazyLock::new(|| {
     Histogram::new(
         "yellowstone_grpc_account_interarrival_us",
@@ -114,6 +121,7 @@ fn register_yellowstone_metrics() {
     let registry = MetricsRegistry::global();
     registry.register_counter(&ACCOUNT_UPDATES_RECEIVED);
     registry.register_counter(&TRANSACTION_UPDATES_RECEIVED);
+    registry.register_counter(&TRANSACTION_UPDATES_REJECTED);
     registry.register_histogram(&ACCOUNT_PROCESS_TIME_NANOS);
     registry.register_histogram(&TRANSACTION_PROCESS_TIME_NANOS);
     registry.register_histogram(&ACCOUNT_INTERARRIVAL_US);
@@ -963,54 +971,110 @@ async fn send_subscribe_update_transaction_info(
 ) {
     let start_time = std::time::Instant::now();
 
-    if let Some(transaction_info) = transaction_info {
-        let Ok(signature) = Signature::try_from(transaction_info.signature) else {
-            return;
-        };
-        let Some(yellowstone_transaction) = transaction_info.transaction else {
-            return;
-        };
-        let Some(yellowstone_tx_meta) = transaction_info.meta else {
-            return;
-        };
-        let Ok(versioned_transaction) = create_tx_versioned(yellowstone_transaction) else {
-            return;
-        };
-        let meta_original = match create_tx_meta(yellowstone_tx_meta) {
-            Ok(meta) => meta,
-            Err(err) => {
-                log::error!("Failed to create transaction meta: {err:?}");
-                return;
-            }
-        };
-        let update = Update::Transaction(Box::new(TransactionUpdate {
-            signature,
-            transaction: versioned_transaction,
-            meta: meta_original,
-            is_vote: transaction_info.is_vote,
-            slot,
-            index: Some(transaction_info.index),
-            block_time,
-            block_hash: None,
-        }));
-        if let Err(e) = sender.try_send((update, id)) {
-            if expected_closed_send_after_cancellation(&e, cancellation_token) {
-                log::debug!(
+    let transaction_update = transaction_info
+        .ok_or(TransactionUpdateRejection::MissingInfo)
+        .and_then(|transaction_info| {
+            convert_transaction_update(transaction_info, slot, block_time)
+        });
+
+    match transaction_update {
+        Ok(transaction_update) => {
+            let signature = transaction_update.signature;
+            let update = Update::Transaction(Box::new(transaction_update));
+            if let Err(e) = sender.try_send((update, id)) {
+                if expected_closed_send_after_cancellation(&e, cancellation_token) {
+                    log::debug!(
                     "Transaction output closed after datasource cancellation for signature {signature:?} at slot {slot}"
                 );
-            } else {
-                log::error!(
+                } else {
+                    log::error!(
                     "Failed to send transaction update with signature {signature:?} at slot {slot}: {e:?}"
                 );
+                }
+                return;
             }
-            return;
-        }
 
-        TRANSACTION_PROCESS_TIME_NANOS.record(start_time.elapsed().as_nanos() as f64);
-        TRANSACTION_UPDATES_RECEIVED.inc();
-    } else {
-        log::error!("No transaction info in `UpdateOneof::Transaction` at slot {slot}");
+            TRANSACTION_PROCESS_TIME_NANOS.record(start_time.elapsed().as_nanos() as f64);
+            TRANSACTION_UPDATES_RECEIVED.inc();
+        }
+        Err(rejection) => {
+            TRANSACTION_UPDATES_REJECTED.inc();
+            if let Some(error) = rejection.conversion_error() {
+                log::warn!(
+                    "Rejected Yellowstone transaction update at slot {slot}: {} ({error})",
+                    rejection.as_label()
+                );
+            } else {
+                log::warn!(
+                    "Rejected Yellowstone transaction update at slot {slot}: {}",
+                    rejection.as_label()
+                );
+            }
+        }
     }
+}
+
+#[derive(Debug)]
+enum TransactionUpdateRejection {
+    MissingInfo,
+    InvalidSignature,
+    MissingTransaction,
+    MissingMeta,
+    InvalidTransaction(ConversionError),
+    InvalidMeta(ConversionError),
+}
+
+impl TransactionUpdateRejection {
+    const fn as_label(&self) -> &'static str {
+        match self {
+            Self::MissingInfo => "missing_info",
+            Self::InvalidSignature => "invalid_signature",
+            Self::MissingTransaction => "missing_transaction",
+            Self::MissingMeta => "missing_meta",
+            Self::InvalidTransaction(_) => "invalid_transaction",
+            Self::InvalidMeta(_) => "invalid_meta",
+        }
+    }
+
+    const fn conversion_error(&self) -> Option<&ConversionError> {
+        match self {
+            Self::InvalidTransaction(error) | Self::InvalidMeta(error) => Some(error),
+            Self::MissingInfo
+            | Self::InvalidSignature
+            | Self::MissingTransaction
+            | Self::MissingMeta => None,
+        }
+    }
+}
+
+fn convert_transaction_update(
+    transaction_info: SubscribeUpdateTransactionInfo,
+    slot: u64,
+    block_time: Option<i64>,
+) -> Result<TransactionUpdate, TransactionUpdateRejection> {
+    let signature = Signature::try_from(transaction_info.signature)
+        .map_err(|_| TransactionUpdateRejection::InvalidSignature)?;
+    let transaction = transaction_info
+        .transaction
+        .ok_or(TransactionUpdateRejection::MissingTransaction)
+        .and_then(|transaction| {
+            create_tx_versioned(transaction).map_err(TransactionUpdateRejection::InvalidTransaction)
+        })?;
+    let meta = transaction_info
+        .meta
+        .ok_or(TransactionUpdateRejection::MissingMeta)
+        .and_then(|meta| create_tx_meta(meta).map_err(TransactionUpdateRejection::InvalidMeta))?;
+
+    Ok(TransactionUpdate {
+        signature,
+        transaction,
+        meta,
+        is_vote: transaction_info.is_vote,
+        slot,
+        index: Some(transaction_info.index),
+        block_time,
+        block_hash: None,
+    })
 }
 
 fn expected_closed_send_after_cancellation<T>(
@@ -1023,6 +1087,44 @@ fn expected_closed_send_after_cancellation<T>(
 #[cfg(test)]
 mod cancellation_tests {
     use super::*;
+
+    fn v1_transaction_info(heap_size: u32) -> SubscribeUpdateTransactionInfo {
+        let payer = Pubkey::new_unique();
+        let program = Pubkey::new_unique();
+        let signature = Signature::from([19; 64]);
+        SubscribeUpdateTransactionInfo {
+            signature: signature.as_ref().to_vec(),
+            is_vote: false,
+            transaction: Some(yellowstone_grpc_proto::prelude::Transaction {
+                signatures: vec![signature.as_ref().to_vec()],
+                message: Some(yellowstone_grpc_proto::prelude::Message {
+                    header: Some(yellowstone_grpc_proto::prelude::MessageHeader {
+                        num_required_signatures: 1,
+                        num_readonly_signed_accounts: 0,
+                        num_readonly_unsigned_accounts: 1,
+                    }),
+                    account_keys: vec![payer.as_ref().to_vec(), program.as_ref().to_vec()],
+                    recent_blockhash: vec![7; 32],
+                    instructions: vec![yellowstone_grpc_proto::prelude::CompiledInstruction {
+                        program_id_index: 1,
+                        accounts: vec![0],
+                        data: vec![1, 2, 3],
+                    }],
+                    versioned: true,
+                    address_table_lookups: vec![],
+                    config: Some(yellowstone_grpc_proto::prelude::TransactionConfig {
+                        heap_size: Some(heap_size),
+                        ..yellowstone_grpc_proto::prelude::TransactionConfig::default()
+                    }),
+                }),
+            }),
+            meta: Some(yellowstone_grpc_proto::prelude::TransactionStatusMeta {
+                return_data_none: true,
+                ..yellowstone_grpc_proto::prelude::TransactionStatusMeta::default()
+            }),
+            index: 3,
+        }
+    }
 
     #[test]
     fn only_closed_send_after_owned_cancellation_is_expected() {
@@ -1041,5 +1143,40 @@ mod cancellation_tests {
 
         let active = CancellationToken::new();
         assert!(!expected_closed_send_after_cancellation(&closed, &active));
+    }
+
+    #[tokio::test]
+    async fn malformed_v1_is_rejected_and_next_valid_v1_is_delivered() {
+        let (sender, mut receiver) = mpsc::channel(2);
+        let id = DatasourceId::new_named("test");
+        let cancellation_token = CancellationToken::new();
+        let rejected_before = TRANSACTION_UPDATES_REJECTED.get();
+
+        send_subscribe_update_transaction_info(
+            Some(v1_transaction_info(32 * 1024 + 1)),
+            &sender,
+            id.clone(),
+            100,
+            None,
+            &cancellation_token,
+        )
+        .await;
+        send_subscribe_update_transaction_info(
+            Some(v1_transaction_info(32 * 1024)),
+            &sender,
+            id,
+            101,
+            None,
+            &cancellation_token,
+        )
+        .await;
+
+        assert_eq!(TRANSACTION_UPDATES_REJECTED.get(), rejected_before + 1);
+        let (Update::Transaction(update), _) = receiver.recv().await.unwrap() else {
+            panic!("valid V1 must remain deliverable after malformed V1");
+        };
+        assert_eq!(update.slot, 101);
+        assert_eq!(update.transaction.message.static_account_keys().len(), 2);
+        assert!(receiver.try_recv().is_err());
     }
 }
