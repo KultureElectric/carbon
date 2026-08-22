@@ -1781,19 +1781,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "carbon-jetstreamer-datasource"
-version = "1.0.0"
-dependencies = [
- "async-trait",
- "carbon-core",
- "futures-util",
- "solana-pubkey 4.2.0",
- "solana-transaction-status-client-types 3.1.14",
- "tokio",
- "tokio-util",
-]
-
-[[package]]
 name = "carbon-jito-protos"
 version = "0.2.4"
 dependencies = [
@@ -1809,7 +1796,6 @@ name = "carbon-jito-shredstream-grpc-datasource"
 version = "1.0.0"
 dependencies = [
  "async-trait",
- "bincode",
  "carbon-core",
  "carbon-jito-protos",
  "futures",
@@ -1820,6 +1806,7 @@ dependencies = [
  "solana-transaction-status 4.1.2",
  "tokio",
  "tokio-util",
+ "wincode",
 ]
 
 [[package]]
@@ -5177,20 +5164,6 @@ name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
-
-[[package]]
-name = "jetstreamer-carbon-example"
-version = "1.0.0"
-dependencies = [
- "carbon-core",
- "carbon-jetstreamer-datasource",
- "carbon-log-metrics",
- "carbon-token-2022-decoder",
- "dotenv",
- "env_logger",
- "log",
- "tokio",
-]
 
 [[package]]
 name = "jiff"

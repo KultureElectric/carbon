@@ -1,5 +1,6 @@
 [workspace]
 members = ["crates/*", "datasources/*", "decoders/*", "examples/*", "metrics/*"]
+exclude = ["datasources/jetstreamer-datasource", "examples/jetstreamer"]
 resolver = "2"
 
 [workspace.package]
@@ -207,6 +208,7 @@ tonic = { version = "0.13.1", features = ["tls-native-roots", "tls-webpki-roots"
 tonic-build = "0.13.1"
 unicode-xid = "0.2"
 uuid = { version = "1.18.1", features = ["serde", "v7"] }
+wincode = "0.5.5"
 yellowstone-grpc-client = { version = "=13.3.0" }
 yellowstone-grpc-convert = { path = "crates/yellowstone-grpc-convert" }
 yellowstone-grpc-proto = { version = "=12.6.0" }
