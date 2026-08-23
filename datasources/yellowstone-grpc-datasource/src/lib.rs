@@ -1160,7 +1160,7 @@ async fn send_subscribe_account_update_info(
         .into_update();
         let is_deletion = matches!(&update, Update::AccountDeletion(_));
 
-        if !try_send_authoritative_update(sender, update, id, slot, cancellation_token)? {
+        if !send_authoritative_update(sender, update, id, slot, cancellation_token).await? {
             return Ok(());
         }
 
@@ -1201,7 +1201,7 @@ async fn send_subscribe_update_transaction_info(
         Ok(transaction_update) => {
             let signature = transaction_update.signature;
             let update = Update::Transaction(Box::new(transaction_update));
-            if !try_send_authoritative_update(sender, update, id, slot, cancellation_token)? {
+            if !send_authoritative_update(sender, update, id, slot, cancellation_token).await? {
                 log::debug!(
                     "Transaction output closed after datasource cancellation for signature {signature:?} at slot {slot}"
                 );
@@ -1233,14 +1233,12 @@ async fn send_subscribe_update_transaction_info(
 
 #[derive(Debug, PartialEq, Eq)]
 enum AuthoritativeOutputError {
-    Full { update_type: UpdateType, slot: u64 },
     Closed { update_type: UpdateType, slot: u64 },
 }
 
 impl AuthoritativeOutputError {
     fn metric_labels(&self) -> (&'static str, &'static str) {
         let (state, update_type) = match self {
-            Self::Full { update_type, .. } => ("full", update_type),
             Self::Closed { update_type, .. } => ("closed", update_type),
         };
         let update_type = match update_type {
@@ -1256,7 +1254,6 @@ impl AuthoritativeOutputError {
 impl fmt::Display for AuthoritativeOutputError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let (state, update_type, slot) = match self {
-            Self::Full { update_type, slot } => ("full", update_type, slot),
             Self::Closed { update_type, slot } => ("closed", update_type, slot),
         };
         write!(
@@ -1266,7 +1263,7 @@ impl fmt::Display for AuthoritativeOutputError {
     }
 }
 
-fn try_send_authoritative_update(
+async fn send_authoritative_update(
     sender: &Sender<(Update, DatasourceId)>,
     update: Update,
     id: DatasourceId,
@@ -1274,19 +1271,23 @@ fn try_send_authoritative_update(
     cancellation_token: &CancellationToken,
 ) -> Result<bool, AuthoritativeOutputError> {
     let update_type = update.update_type();
-    match sender.try_send((update, id)) {
-        Ok(()) => Ok(true),
-        Err(error) if expected_closed_send_after_cancellation(&error, cancellation_token) => {
+    tokio::select! {
+        biased;
+        _ = cancellation_token.cancelled() => {
             log::debug!(
-                "Authoritative {update_type:?} output closed after datasource cancellation at slot {slot}"
+                "Authoritative {update_type:?} output cancelled at slot {slot}"
             );
             Ok(false)
         }
-        Err(mpsc::error::TrySendError::Full(_)) => {
-            Err(AuthoritativeOutputError::Full { update_type, slot })
-        }
-        Err(mpsc::error::TrySendError::Closed(_)) => {
-            Err(AuthoritativeOutputError::Closed { update_type, slot })
+        result = sender.send((update, id)) => match result {
+            Ok(()) => Ok(true),
+            Err(_) if cancellation_token.is_cancelled() => {
+                log::debug!(
+                    "Authoritative {update_type:?} output closed after datasource cancellation at slot {slot}"
+                );
+                Ok(false)
+            }
+            Err(_) => Err(AuthoritativeOutputError::Closed { update_type, slot }),
         }
     }
 }
@@ -1389,13 +1390,6 @@ fn convert_transaction_update(
         block_time,
         block_hash: None,
     })
-}
-
-fn expected_closed_send_after_cancellation<T>(
-    error: &mpsc::error::TrySendError<T>,
-    cancellation_token: &CancellationToken,
-) -> bool {
-    cancellation_token.is_cancelled() && matches!(error, mpsc::error::TrySendError::Closed(_))
 }
 
 #[cfg(test)]
@@ -1521,20 +1515,6 @@ mod cancellation_tests {
     fn authoritative_output_failure_metrics_use_only_closed_labels() {
         let cases = [
             (
-                AuthoritativeOutputError::Full {
-                    update_type: UpdateType::AccountUpdate,
-                    slot: 1,
-                },
-                ("full", "account_update"),
-            ),
-            (
-                AuthoritativeOutputError::Full {
-                    update_type: UpdateType::Transaction,
-                    slot: 2,
-                },
-                ("full", "transaction"),
-            ),
-            (
                 AuthoritativeOutputError::Closed {
                     update_type: UpdateType::AccountDeletion,
                     slot: 3,
@@ -1560,7 +1540,7 @@ mod cancellation_tests {
             "yellowstone",
             "accounts-and-transactions",
         );
-        let error = AuthoritativeOutputError::Full {
+        let error = AuthoritativeOutputError::Closed {
             update_type: UpdateType::Transaction,
             slot: 5,
         };
@@ -1571,29 +1551,10 @@ mod cancellation_tests {
                 metrics::Label::new("region", "fra"),
                 metrics::Label::new("source", "yellowstone"),
                 metrics::Label::new("subscription", "accounts-and-transactions"),
-                metrics::Label::new("state", "full"),
+                metrics::Label::new("state", "closed"),
                 metrics::Label::new("update_type", "transaction"),
             ]
         );
-    }
-
-    #[test]
-    fn only_closed_send_after_owned_cancellation_is_expected() {
-        let token = CancellationToken::new();
-        let (sender, receiver) = mpsc::channel::<u8>(1);
-
-        sender.try_send(1).unwrap();
-        let full = sender.try_send(2).unwrap_err();
-        assert!(!expected_closed_send_after_cancellation(&full, &token));
-        token.cancel();
-        assert!(!expected_closed_send_after_cancellation(&full, &token));
-
-        drop(receiver);
-        let closed = sender.try_send(3).unwrap_err();
-        assert!(expected_closed_send_after_cancellation(&closed, &token));
-
-        let active = CancellationToken::new();
-        assert!(!expected_closed_send_after_cancellation(&closed, &active));
     }
 
     #[tokio::test]
@@ -1637,8 +1598,8 @@ mod cancellation_tests {
     }
 
     #[tokio::test]
-    async fn full_block_transaction_output_fails_the_stream_generation() {
-        let (sender, _receiver) = mpsc::channel(1);
+    async fn full_transaction_output_applies_backpressure_without_losing_the_update() {
+        let (sender, mut receiver) = mpsc::channel(1);
         let id = DatasourceId::new_named("test");
         let cancellation_token = CancellationToken::new();
         let ingress_metrics = ingress_metrics();
@@ -1655,7 +1616,7 @@ mod cancellation_tests {
         .await
         .unwrap();
 
-        let error = send_subscribe_update_transaction_info(
+        let second_send = send_subscribe_update_transaction_info(
             Some(v1_transaction_info(32 * 1024)),
             &sender,
             id,
@@ -1663,22 +1624,28 @@ mod cancellation_tests {
             Some(1_700_000_001),
             &cancellation_token,
             &ingress_metrics,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            AuthoritativeOutputError::Full {
-                update_type: UpdateType::Transaction,
-                slot: 201,
-            }
         );
+        tokio::pin!(second_send);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), second_send.as_mut())
+                .await
+                .is_err()
+        );
+        let _first = receiver.recv().await.expect("first update");
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_send)
+            .await
+            .expect("backpressured send resumes")
+            .expect("second update delivered");
+        let (Update::Transaction(update), _) = receiver.recv().await.expect("second update") else {
+            panic!("second output must be the transaction held by backpressure");
+        };
+        assert_eq!(update.slot, 201);
     }
 
     #[tokio::test]
-    async fn full_account_output_fails_the_stream_generation() {
-        let (sender, _receiver) = mpsc::channel(1);
+    async fn full_account_output_applies_backpressure_without_losing_the_update() {
+        let (sender, mut receiver) = mpsc::channel(1);
         let id = DatasourceId::new_named("test");
         let cancellation_token = CancellationToken::new();
         send_subscribe_account_update_info(
@@ -1691,23 +1658,29 @@ mod cancellation_tests {
         .await
         .unwrap();
 
-        let error = send_subscribe_account_update_info(
+        let second_send = send_subscribe_account_update_info(
             Some(account_info()),
             &sender,
             id,
             301,
             &cancellation_token,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(
-            error,
-            AuthoritativeOutputError::Full {
-                update_type: UpdateType::AccountUpdate,
-                slot: 301,
-            }
         );
+        tokio::pin!(second_send);
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), second_send.as_mut())
+                .await
+                .is_err()
+        );
+        let _first = receiver.recv().await.expect("first update");
+        tokio::time::timeout(std::time::Duration::from_secs(1), second_send)
+            .await
+            .expect("backpressured send resumes")
+            .expect("second update delivered");
+        let (Update::Account(update), _) = receiver.recv().await.expect("second update") else {
+            panic!("second output must be the account held by backpressure");
+        };
+        assert_eq!(update.slot, 301);
     }
 
     #[tokio::test]
