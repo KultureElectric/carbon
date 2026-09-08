@@ -143,6 +143,7 @@ impl AccountUpdate {
                 account,
                 slot,
                 transaction_signature,
+                write_version,
             })
         }
     }
@@ -168,6 +169,7 @@ pub struct AccountDeletion {
     pub account: Account,
     pub slot: u64,
     pub transaction_signature: Option<Signature>,
+    pub write_version: Option<u64>,
 }
 
 /// Block-level metadata emitted by block-aware datasources.
@@ -216,6 +218,7 @@ mod tests {
         assert_eq!(deletion.account.data, vec![1, 2, 3]);
         assert_eq!(deletion.slot, 7);
         assert_eq!(deletion.transaction_signature, transaction_signature);
+        assert_eq!(deletion.write_version, Some(11));
     }
 
     #[test]

@@ -232,8 +232,8 @@ fn source_control_slot_filters() -> HashMap<String, SubscribeRequestFilterSlots>
     )])
 }
 
-async fn subscribe_with_subscription_id<F>(
-    geyser_client: &mut GeyserGrpcClient<F>,
+async fn subscribe_with_subscription_id(
+    geyser_client: &mut GeyserGrpcClient,
     subscribe_request: SubscribeRequest,
     subscription_id: &str,
 ) -> Result<
@@ -242,10 +242,7 @@ async fn subscribe_with_subscription_id<F>(
         Streaming<SubscribeUpdate>,
     ),
     String,
->
-where
-    F: yellowstone_grpc_client::Interceptor,
-{
+> {
     let (mut subscribe_tx, subscribe_rx) = futures::channel::mpsc::unbounded();
     subscribe_tx
         .send(subscribe_request)
@@ -1334,24 +1331,7 @@ impl TransactionUpdateRejection {
     }
 
     const fn metric_label(&self) -> &'static str {
-        match self {
-            Self::MissingInfo => "missing_info",
-            Self::InvalidSignature => "invalid_signature",
-            Self::MissingTransaction => "missing_transaction",
-            Self::MissingMeta => "missing_meta",
-            Self::InvalidTransaction(ConversionError::Legacy(_)) => "invalid_transaction",
-            Self::InvalidTransaction(ConversionError::InvalidV1Message(_)) => "invalid_v1_message",
-            Self::InvalidTransaction(ConversionError::V1AddressTableLookups) => {
-                "v1_address_table_lookups"
-            }
-            Self::InvalidTransaction(ConversionError::V1TransactionTooLarge) => {
-                "v1_transaction_too_large"
-            }
-            Self::InvalidTransaction(ConversionError::InvalidV1SignatureCount) => {
-                "invalid_v1_signature_count"
-            }
-            Self::InvalidMeta(_) => "invalid_meta",
-        }
+        self.as_label()
     }
 }
 
@@ -1427,11 +1407,24 @@ mod cancellation_tests {
         }
     }
 
+    fn malformed_v1_transaction_info() -> SubscribeUpdateTransactionInfo {
+        let mut transaction_info = v1_transaction_info(32 * 1024);
+        transaction_info
+            .transaction
+            .as_mut()
+            .expect("transaction")
+            .message
+            .as_mut()
+            .expect("message")
+            .account_keys[0] = vec![0; 31];
+        transaction_info
+    }
+
     fn account_info() -> SubscribeUpdateAccountInfo {
         SubscribeUpdateAccountInfo {
             pubkey: Pubkey::new_unique().to_bytes().to_vec(),
             lamports: 1,
-            owner: solana_system_interface::program::ID.to_bytes().to_vec(),
+            owner: Pubkey::new_unique().to_bytes().to_vec(),
             executable: false,
             rent_epoch: 0,
             data: vec![],
@@ -1493,7 +1486,7 @@ mod cancellation_tests {
 
     #[test]
     fn malformed_v1_has_bounded_version_and_rejection_labels() {
-        let transaction_info = v1_transaction_info(32 * 1024 + 1);
+        let transaction_info = malformed_v1_transaction_info();
         assert_eq!(
             YellowstoneTransactionVersion::from_transaction_info(Some(&transaction_info))
                 .as_label(),
@@ -1501,7 +1494,7 @@ mod cancellation_tests {
         );
 
         let rejection = convert_transaction_update(transaction_info, 500, None).unwrap_err();
-        assert_eq!(rejection.metric_label(), "invalid_v1_message");
+        assert_eq!(rejection.metric_label(), "invalid_transaction");
     }
 
     #[test]
@@ -1559,7 +1552,7 @@ mod cancellation_tests {
         let ingress_metrics = ingress_metrics();
 
         send_subscribe_update_transaction_info(
-            Some(v1_transaction_info(32 * 1024 + 1)),
+            Some(malformed_v1_transaction_info()),
             &sender,
             id.clone(),
             100,
