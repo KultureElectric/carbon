@@ -14,14 +14,7 @@ use {
     solana_account::Account,
     solana_pubkey::Pubkey,
     solana_signature::Signature,
-    std::{
-        collections::HashMap,
-        convert::TryFrom,
-        env,
-        fmt,
-        sync::LazyLock,
-        time::Duration,
-    },
+    std::{collections::HashMap, convert::TryFrom, env, fmt, sync::LazyLock, time::Duration},
     tokio::sync::{mpsc, mpsc::Sender},
     tokio_util::sync::CancellationToken,
     yellowstone_grpc_client::{
