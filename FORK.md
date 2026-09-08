@@ -39,8 +39,8 @@ including transaction V1 protobuf conversion in `carbon-core`.
 
 ### Jito ShredStream on Solana 4
 
-- Keep the datasource in the v2 workspace on Agave 4.2 and deserialize entries
-  with the Agave wincode format.
+- Keep the datasource in the v2 workspace on the Agave 4.2.1–4.2.2 entry line
+  and deserialize entries with the Agave wincode format.
 - Reject trailing bytes and skip malformed transactions with no signatures.
 
 ## Retained legacy-provider source

@@ -10,7 +10,6 @@ use {
     },
     futures::{stream::try_unfold, TryStreamExt},
     scc::HashCache,
-    solana_client::rpc_client::SerializableTransaction,
     solana_entry::entry::Entry,
     solana_transaction_status::TransactionStatusMeta,
     std::{
@@ -157,7 +156,7 @@ impl Datasource for JitoShredstreamGrpcClient {
                                     continue;
                                 }
 
-                                let signature = *transaction.get_signature();
+                                let signature = transaction.signatures[0];
 
                                 let update = Update::Transaction(Box::new(TransactionUpdate {
                                     signature,
