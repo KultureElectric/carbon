@@ -950,7 +950,7 @@ impl Datasource for YellowstoneGrpcGeyserClient {
                                                 last_account_arrival = Some(arrival_time);
                                                 arrival_count += 1;
 
-                                                if arrival_count > 1 && arrival_count % 5000 == 0 {
+                                        if arrival_count > 1 && arrival_count.is_multiple_of(5000) {
                                                     let avg_delta_us = total_delta_us / (arrival_count - 1);
                                                     log::info!(
                                                         "Account arrival stats (slot {}): count={}, avg_delta={}us, min={}us, max={}us",
