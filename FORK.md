@@ -43,6 +43,12 @@ including transaction V1 protobuf conversion in `carbon-core`.
   with the Agave wincode format.
 - Reject trailing bytes and skip malformed transactions with no signatures.
 
+### Polaris build compatibility
+
+- Keep the workspace MSRV and CI toolchain at Rust 1.95.0, matching the
+  admitted Polaris build image. The core, Yellowstone, and Jito v2 suites are
+  verified on that compiler.
+
 ## Retained legacy-provider source
 
 Upstream v2 excludes Jetstreamer while that provider remains on its Solana v3

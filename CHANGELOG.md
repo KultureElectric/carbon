@@ -6,7 +6,7 @@ Carbon 2.0 is the Agave 4 compatibility release. It upgrades the supported Solan
 
 ### Highlights
 
-- Upgraded the workspace to the Agave 4.2-compatible Solana crates and Rust 1.96.1.
+- Upgraded the workspace to the Agave 4.2-compatible Solana crates and Rust 1.95.0.
 - Added Transaction V1 conversion and instruction traversal, including runtime inner instructions and V1 account metadata.
 - Added strict Yellowstone protobuf conversion for legacy, V0, and V1 transactions.
 - Classified zero-lamport account updates as `Update::AccountDeletion` consistently while preserving the final `Account` state.
@@ -23,7 +23,7 @@ Carbon 2.0 is the Agave 4 compatibility release. It upgrades the supported Solan
 
 #### Toolchain and dependencies
 
-Carbon 2 requires Rust 1.96.1. The companion 0.13 CLI, renderer, and version-registry packages require Node.js 20.18.0 or newer. Update every directly declared Carbon crate to `2.0.0` and keep direct Solana dependencies compatible with the Agave 4.2 cohort. Do not mix Carbon 2 with Carbon 1 datasource or decoder crates in one dependency graph.
+Carbon 2 requires Rust 1.95.0. The companion 0.13 CLI, renderer, and version-registry packages require Node.js 20.18.0 or newer. Update every directly declared Carbon crate to `2.0.0` and keep direct Solana dependencies compatible with the Agave 4.2 cohort. Do not mix Carbon 2 with Carbon 1 datasource or decoder crates in one dependency graph.
 
 If Carbon types appear in your public API, update imports and fix type mismatches after resolving the new Solana crates. A single version of each Solana type crate should resolve in the final graph.
 
