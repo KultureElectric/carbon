@@ -13,7 +13,7 @@ categories = ["encoding"]
 crate-type = ["rlib"]
 
 [dependencies]
-solana-entry = { version = ">=4.2.1, <=4.2.2", features = ["agave-unstable-api"] }
+solana-entry = { workspace = true, features = ["agave-unstable-api"] }
 solana-transaction-status = { workspace = true }
 
 carbon-core = { workspace = true }
