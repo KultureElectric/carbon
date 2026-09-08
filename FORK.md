@@ -37,18 +37,21 @@ including transaction V1 protobuf conversion in `carbon-core`.
 - Keep the Jupiter swap decoder additions needed by Polaris historical swap
   ingestion, with a reproducible regeneration script.
 
+### Jito ShredStream on Solana 4
+
+- Keep the datasource in the v2 workspace on Agave 4.2 and deserialize entries
+  with the Agave wincode format.
+- Reject trailing bytes and skip malformed transactions with no signatures.
+
 ## Retained legacy-provider source
 
-Upstream v2 excludes Jetstreamer and Jito ShredStream from its workspace while
-those providers remain on their Solana v3 stacks. Their Polaris source changes
-remain in this branch for forward-porting or maintenance on a compatible 1.x
-line:
+Upstream v2 excludes Jetstreamer while that provider remains on its Solana v3
+stack. Its Polaris source changes remain in this branch for forward-porting or
+maintenance on a compatible 1.x line:
 
 - Jetstreamer buffers transactions until its block callback supplies historical
   block time and block hash, then flushes unmatched transactions with a metric.
-- Jito ShredStream skips malformed transactions with an empty signature list.
-
-These excluded packages are not part of the Carbon v2 build or release.
+  The excluded Jetstreamer package is not part of the Carbon v2 build or release.
 
 ## Upstream-owned behavior
 

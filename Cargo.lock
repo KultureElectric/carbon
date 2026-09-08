@@ -1682,6 +1682,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "carbon-jito-protos"
+version = "0.2.4"
+dependencies = [
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "protobuf-src",
+ "tonic 0.13.1",
+ "tonic-build 0.13.1",
+]
+
+[[package]]
+name = "carbon-jito-shredstream-grpc-datasource"
+version = "2.0.0"
+dependencies = [
+ "async-trait",
+ "carbon-core",
+ "carbon-jito-protos",
+ "futures",
+ "log",
+ "scc",
+ "solana-client",
+ "solana-entry",
+ "solana-transaction-status",
+ "tokio",
+ "tokio-util",
+ "wincode",
+]
+
+[[package]]
 name = "carbon-jupiter-dca-decoder"
 version = "2.0.0"
 dependencies = [
@@ -4545,7 +4574,7 @@ dependencies = [
  "libc",
  "percent-encoding",
  "pin-project-lite",
- "socket2",
+ "socket2 0.6.5",
  "tokio",
  "tower-service",
  "tracing",
@@ -6110,12 +6139,42 @@ dependencies = [
 
 [[package]]
 name = "prost"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
+dependencies = [
+ "bytes",
+ "prost-derive 0.13.5",
+]
+
+[[package]]
+name = "prost"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "528ac67416ff8646872a3c02cad9cc4ee5dc9f9540c9b10771855c95cb2e5ae1"
 dependencies = [
  "bytes",
- "prost-derive",
+ "prost-derive 0.14.4",
+]
+
+[[package]]
+name = "prost-build"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be769465445e8c1474e9c5dac2018218498557af32d9ed057325ec9a41ae81bf"
+dependencies = [
+ "heck",
+ "itertools 0.14.0",
+ "log",
+ "multimap",
+ "once_cell",
+ "petgraph",
+ "prettyplease",
+ "prost 0.13.5",
+ "prost-types 0.13.5",
+ "regex",
+ "syn 2.0.119",
+ "tempfile",
 ]
 
 [[package]]
@@ -6131,13 +6190,26 @@ dependencies = [
  "once_cell",
  "petgraph",
  "prettyplease",
- "prost",
- "prost-types",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "regex",
  "syn 2.0.119",
  "tempfile",
+]
+
+[[package]]
+name = "prost-derive"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
+dependencies = [
+ "anyhow",
+ "itertools 0.14.0",
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -6155,11 +6227,20 @@ dependencies = [
 
 [[package]]
 name = "prost-types"
+version = "0.13.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52c2c1bf36ddb1a1c396b3601a3cec27c2462e45f07c386894ec3ccf5332bd16"
+dependencies = [
+ "prost 0.13.5",
+]
+
+[[package]]
+name = "prost-types"
 version = "0.14.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
- "prost",
+ "prost 0.14.4",
 ]
 
 [[package]]
@@ -6308,7 +6389,7 @@ dependencies = [
  "quinn-udp",
  "rustc-hash",
  "rustls",
- "socket2",
+ "socket2 0.6.5",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
@@ -6348,7 +6429,7 @@ dependencies = [
  "cfg_aliases",
  "libc",
  "once_cell",
- "socket2",
+ "socket2 0.6.5",
  "tracing",
  "windows-sys 0.60.2",
 ]
@@ -7000,6 +7081,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "scc"
+version = "2.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "46e6f046b7fef48e2660c57ed794263155d713de679057f2d0c169bfc6e756cc"
+dependencies = [
+ "sdd",
+]
+
+[[package]]
 name = "schannel"
 version = "0.1.28"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7013,6 +7103,12 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
+
+[[package]]
+name = "sdd"
+version = "3.0.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "490dcfcbfef26be6800d11870ff2df8774fa6e86d047e3e8c8a76b25655e41ca"
 
 [[package]]
 name = "seahash"
@@ -7406,6 +7502,16 @@ dependencies = [
  "solana-account 4.3.2",
  "solana-pubkey 4.2.1",
  "tokio",
+]
+
+[[package]]
+name = "socket2"
+version = "0.5.10"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e22376abed350d73dd1cd119b57ffccad95b4e585a7cda43e286245ce23c0678"
+dependencies = [
+ "libc",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -8549,7 +8655,7 @@ dependencies = [
  "mockall",
  "num_cpus",
  "num_enum",
- "prost",
+ "prost 0.14.4",
  "qualifier_attr",
  "rand 0.9.5",
  "rand_chacha 0.9.0",
@@ -8740,7 +8846,7 @@ dependencies = [
  "nix",
  "rand 0.9.5",
  "serde",
- "socket2",
+ "socket2 0.6.5",
  "solana-serde",
  "solana-svm-type-overrides",
  "thiserror 2.0.20",
@@ -9777,8 +9883,8 @@ dependencies = [
  "http",
  "hyper-util",
  "log",
- "prost",
- "prost-types",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
  "serde",
  "smpl_jwt",
  "solana-clock",
@@ -9794,7 +9900,7 @@ dependencies = [
  "solana-transaction-status",
  "thiserror 2.0.20",
  "tokio",
- "tonic",
+ "tonic 0.14.6",
  "tonic-prost",
  "zstd",
 ]
@@ -9806,7 +9912,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "54be805c0762f616e6095a48dfc3b6720de02ac8702d003c1b7c1d3426b1e358"
 dependencies = [
  "bs58",
- "prost",
+ "prost 0.14.4",
  "protobuf-src",
  "serde",
  "solana-account-decoder",
@@ -11462,7 +11568,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "pin-project-lite",
  "signal-hook-registry",
- "socket2",
+ "socket2 0.6.5",
  "tokio-macros",
  "windows-sys 0.61.2",
 ]
@@ -11575,6 +11681,38 @@ dependencies = [
 
 [[package]]
 name = "tonic"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "bytes",
+ "h2",
+ "http",
+ "http-body",
+ "http-body-util",
+ "hyper",
+ "hyper-timeout",
+ "hyper-util",
+ "percent-encoding",
+ "pin-project",
+ "prost 0.13.5",
+ "rustls-native-certs",
+ "socket2 0.5.10",
+ "tokio",
+ "tokio-rustls",
+ "tokio-stream",
+ "tower",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "tonic"
 version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
@@ -11594,7 +11732,7 @@ dependencies = [
  "percent-encoding",
  "pin-project",
  "rustls-native-certs",
- "socket2",
+ "socket2 0.6.5",
  "sync_wrapper",
  "tokio",
  "tokio-rustls",
@@ -11604,6 +11742,20 @@ dependencies = [
  "tower-service",
  "tracing",
  "zstd",
+]
+
+[[package]]
+name = "tonic-build"
+version = "0.13.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eac6f67be712d12f0b41328db3137e0d0757645d8904b4cb7d51cd9c2279e847"
+dependencies = [
+ "prettyplease",
+ "proc-macro2",
+ "prost-build 0.13.5",
+ "prost-types 0.13.5",
+ "quote",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -11624,10 +11776,10 @@ version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2a82868bf299e0a1d2e8dce0dc33a46c02d6f045b2c1f1d6cc8dc3d0bf1812ef"
 dependencies = [
- "prost",
+ "prost 0.14.4",
  "tokio",
  "tokio-stream",
- "tonic",
+ "tonic 0.14.6",
  "tonic-prost",
 ]
 
@@ -11638,8 +11790,8 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
 dependencies = [
  "bytes",
- "prost",
- "tonic",
+ "prost 0.14.4",
+ "tonic 0.14.6",
 ]
 
 [[package]]
@@ -11650,12 +11802,12 @@ checksum = "654e5643eff75d7f8c99197ce1440ed19a3474eada74c12bbac488b2cafdae27"
 dependencies = [
  "prettyplease",
  "proc-macro2",
- "prost-build",
- "prost-types",
+ "prost-build 0.14.1",
+ "prost-types 0.14.4",
  "quote",
  "syn 2.0.119",
  "tempfile",
- "tonic-build",
+ "tonic-build 0.14.6",
 ]
 
 [[package]]
@@ -12601,7 +12753,7 @@ dependencies = [
  "pin-project",
  "thiserror 2.0.20",
  "tokio",
- "tonic",
+ "tonic 0.14.6",
  "tonic-health",
  "tower",
  "yellowstone-grpc-proto",
@@ -12614,13 +12766,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a5c845c3eaa82bf075d1e553826e629eda16a74e9fdbe886ec07bd7434d132af"
 dependencies = [
  "anyhow",
- "prost",
- "prost-types",
+ "prost 0.14.4",
+ "prost-types 0.14.4",
  "protoc-bin-vendored",
  "siphasher 1.0.1",
  "solana-pubkey 4.2.1",
  "thiserror 2.0.20",
- "tonic",
+ "tonic 0.14.6",
  "tonic-prost",
  "tonic-prost-build",
 ]

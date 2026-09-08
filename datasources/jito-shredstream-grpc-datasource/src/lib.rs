@@ -52,6 +52,10 @@ fn register_jito_shredstream_metrics() {
     registry.register_histogram(&ENTRY_PROCESS_TIME_NANOS);
 }
 
+fn deserialize_entries(data: &[u8]) -> wincode::ReadResult<Vec<Entry>> {
+    wincode::deserialize_exact(data)
+}
+
 #[derive(Debug)]
 pub struct JitoShredstreamGrpcClient(String);
 
@@ -126,7 +130,7 @@ impl Datasource for JitoShredstreamGrpcClient {
                         let block_time =
                             Some(recv_time.duration_since(UNIX_EPOCH).expect("Time").as_millis() as i64);
 
-                        let entries: Vec<Entry> = match bincode::deserialize(&message.entries) {
+                        let entries = match deserialize_entries(&message.entries) {
                             Ok(e) => e,
                             Err(e) => {
                                 log::error!("Failed to deserialize entries at slot {}: {e:?}", message.slot);
@@ -194,5 +198,29 @@ impl Datasource for JitoShredstreamGrpcClient {
 
     fn update_types(&self) -> Vec<UpdateType> {
         vec![UpdateType::Transaction]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deserialize_entries_uses_agave_4_wincode_format() {
+        let expected = vec![Entry::default()];
+        let encoded = wincode::serialize(&expected).expect("encode entries");
+
+        assert_eq!(
+            deserialize_entries(&encoded).expect("decode entries"),
+            expected
+        );
+    }
+
+    #[test]
+    fn deserialize_entries_rejects_trailing_bytes() {
+        let mut encoded = wincode::serialize(&vec![Entry::default()]).expect("encode entries");
+        encoded.push(0xff);
+
+        assert!(deserialize_entries(&encoded).is_err());
     }
 }

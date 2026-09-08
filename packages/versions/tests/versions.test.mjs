@@ -8,6 +8,7 @@ const V2_DATASOURCES = [
     'carbon-helius-gpa-v2-datasource',
     'carbon-helius-gtfa-datasource',
     'carbon-helius-laserstream-datasource',
+    'carbon-jito-shredstream-grpc-datasource',
     'carbon-rpc-block-crawler-datasource',
     'carbon-rpc-block-subscribe-datasource',
     'carbon-rpc-gpa-datasource',
@@ -38,5 +39,5 @@ test('lists all and only the supported v2 datasource crates', () => {
 
     assert.deepEqual(datasourceCrates, [...V2_DATASOURCES].sort());
     assert.equal(VERSIONS['carbon-jetstreamer-datasource'], undefined);
-    assert.equal(VERSIONS['carbon-jito-shredstream-grpc-datasource'], undefined);
+    assert.equal(versionOf(VERSIONS['carbon-jito-shredstream-grpc-datasource']), CARBON_VERSION);
 });

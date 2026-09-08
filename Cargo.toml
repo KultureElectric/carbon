@@ -1,10 +1,9 @@
 [workspace]
 members = ["crates/*", "datasources/*", "decoders/*", "examples/*", "metrics/*"]
-# These providers remain on their existing Solana v3 stacks and are intentionally
+# Jetstreamer remains on its existing Solana v3 stack and is intentionally
 # outside the v4 migration scope.
 exclude = [
     "datasources/jetstreamer-datasource",
-    "datasources/jito-shredstream-grpc-datasource",
     "examples/jetstreamer",
 ]
 resolver = "2"
@@ -38,7 +37,7 @@ carbon-helius-gtfa-datasource = { path = "datasources/helius-gtfa-datasource", v
 carbon-helius-laserstream-datasource = { path = "datasources/helius-laserstream-datasource", version = "2.0.0" }
 # Legacy providers remain on Carbon 1.x until they migrate to the Solana v4 stack.
 carbon-jetstreamer-datasource = { path = "datasources/jetstreamer-datasource", version = "1.0.0" }
-carbon-jito-shredstream-grpc-datasource = { path = "datasources/jito-shredstream-grpc-datasource", version = "1.0.0" }
+carbon-jito-shredstream-grpc-datasource = { path = "datasources/jito-shredstream-grpc-datasource", version = "2.0.0" }
 carbon-rpc-block-crawler-datasource = { path = "datasources/rpc-block-crawler-datasource", version = "2.0.0" }
 carbon-rpc-block-subscribe-datasource = { path = "datasources/rpc-block-subscribe-datasource", version = "2.0.0" }
 carbon-rpc-gpa-datasource = { path = "datasources/rpc-gpa-datasource", version = "2.0.0" }
