@@ -1,55 +1,72 @@
 # KultureElectric/carbon Fork
 
-Changes maintained on top of [sevenlabs-hq/carbon](https://github.com/sevenlabs-hq/carbon) `main`.
+This branch carries Polaris-specific behavior on top of
+[`sevenlabs-hq/carbon`](https://github.com/sevenlabs-hq/carbon) v2.0.0
+(`e901103c`). Carbon v2 supplies the Solana/Agave 4 transaction model,
+including transaction V1 protobuf conversion in `carbon-core`.
 
-## Changes
+## Maintained v2 changes
 
-### `write_version` on AccountUpdate / AccountMetadata
-- Added `write_version: Option<u64>` to `AccountUpdate` (datasource.rs) and `AccountMetadata` (account.rs)
-- Propagated through the pipeline (pipeline.rs)
-- Set from yellowstone-grpc and helius-laserstream datasources (which expose it from geyser)
-- Set to `None` for datasources that don't provide it (rpc-gpa, rpc-program-subscribe, helius-atlas-ws, helius-gpa-v2, validator-snapshot)
-- Used downstream for ordering account updates within a slot
+### Account ordering metadata
 
-### ShredStream empty-signature guard
-- `jito-shredstream-grpc-datasource`: skip transactions with empty signatures array
-- `get_signature()` panics on malformed transactions; this guard prevents crashes
+- Propagate `write_version: Option<u64>` through `AccountUpdate`,
+  `AccountDeletion`, `AccountMetadata`, and the account pipeline.
+- Populate it from Yellowstone and Helius Laserstream, which expose the Geyser
+  write version. Other account datasources use `None`.
 
-### Yellowstone inter-arrival timing metrics
-- Intra-slot span histograms (`yellowstone_grpc_slot_span_us`)
-- Per-slot update count (`yellowstone_grpc_slot_update_count`)
-- Intra-slot inter-arrival deltas (`yellowstone_grpc_intra_slot_interarrival_us`)
-- Global account inter-arrival deltas (`yellowstone_grpc_account_interarrival_us`)
-- Debug logging every 5000 account updates, final stats on cancellation
+### Yellowstone continuity and observability
 
-### Yellowstone ingress byte metrics
-- Decoded protobuf payload byte counter (`yellowstone_grpc_ingress_bytes_total`)
-- Message counter (`yellowstone_grpc_ingress_messages_total`)
-- Message size histogram (`yellowstone_grpc_ingress_message_bytes`)
-- Subscription connection gauge (`yellowstone_grpc_subscription_connected`)
-- Labels: `service`, `region`, `source`, `subscription`, and `update_type` for payload metrics
+- Apply bounded, lossless backpressure to authoritative account and
+  transaction output instead of dropping updates when a channel is full.
+- Treat a closed output channel during cancellation as expected shutdown;
+  surface an unexpected closure and reconnect otherwise.
+- Reject malformed protobuf transactions without ending the subscription, and
+  count rejections with bounded transaction-version and reason labels.
+- Track ingress bytes, messages, connection state, per-update processing time,
+  inter-arrival timing, source-control progress, and output failures using
+  bounded service/region/source/subscription labels.
+- Send the configured `x-subscription-id` metadata on subscriptions and reuse a
+  fixed slot filter to observe source progress without a second stream.
 
-### Already upstream in v1
-- Jetstreamer now uses `transaction.transaction_slot_index` for the transaction index field
+### Decoder and generator behavior
 
-### Jetstreamer historical transaction metadata
-- `carbon-jetstreamer-datasource` now requests block callbacks whenever transaction
-  callbacks are enabled, even if the caller did not request public `BlockDetails`
-  updates.
-- Matching transactions are buffered by `(thread_id, slot)` until the block callback
-  provides historical `block_time` and `blockhash`.
-- Buffered transactions are emitted with `TransactionUpdate.block_time` and
-  `TransactionUpdate.block_hash` populated from the historical block, allowing
-  downstream backfill writers to use block time instead of wall-clock ingest time.
-- Any transactions left buffered after firehose completion are flushed without
-  block metadata and counted via `jetstreamer_transactions_sent_without_block_time_total`.
+- Preserve lossless `u64` instruction discriminators in the TypeScript CLI and
+  Rust renderer.
+- Support strict instruction generation while leaving account collections with
+  the looser traits required by downstream Carbon processors.
+- Keep the Jupiter swap decoder additions needed by Polaris historical swap
+  ingestion, with a reproducible regeneration script.
 
-## Rebasing onto upstream
+## Retained legacy-provider source
+
+Upstream v2 excludes Jetstreamer and Jito ShredStream from its workspace while
+those providers remain on their Solana v3 stacks. Their Polaris source changes
+remain in this branch for forward-porting or maintenance on a compatible 1.x
+line:
+
+- Jetstreamer buffers transactions until its block callback supplies historical
+  block time and block hash, then flushes unmatched transactions with a metric.
+- Jito ShredStream skips malformed transactions with an empty signature list.
+
+These excluded packages are not part of the Carbon v2 build or release.
+
+## Upstream-owned behavior
+
+The fork no longer carries separate patches for Solana/Agave 4, transaction V1
+conversion, Yellowstone protobuf compatibility, or Jetstreamer's transaction
+slot index. Those behaviors are in upstream v2. The former
+`yellowstone-grpc-convert` crate has been replaced by
+`carbon_core::transformers::yellowstone`.
+
+## Rebasing
+
+Start from the intended upstream release and replay only commits whose behavior
+is still absent upstream. Resolve against the upstream v2 public API, then run
+the core, Yellowstone, generator, and downstream Polaris checks before moving a
+production dependency pin.
 
 ```bash
 git fetch upstream
-git switch -c kulture/upstream-v1-polaris upstream/main
-# Re-apply the fork commits that still differ from upstream.
-git cherry-pick <write_version> <shredstream-empty-signature> <yellowstone-timing> <fork-docs> <yellowstone-ingress-bytes>
-git push origin kulture/upstream-v1-polaris
+git switch -c kulture/v2-polaris upstream/v2.0.0
+git cherry-pick <retained-commits>
 ```
