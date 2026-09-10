@@ -1,7 +1,16 @@
 # Carbon Jetstreamer Datasource
 
-> [!NOTE]
-> This datasource remains on Carbon 1 / Solana 3 and is not published in the
-> Carbon 2 release because Jetstreamer does not yet support the Solana v4 stack.
-> The directory is retained as archival source and is not buildable inside the
-> Carbon 2 workspace; use the published 1.x crate from a Carbon 1 application.
+Historical Solana transaction and block ingestion from Jetstreamer/Old
+Faithful. The Carbon 2 datasource pins the first reviewed Jetstreamer revision
+with Agave 4 and Transaction V1 decoding because those changes have not yet
+been published as a crate release.
+
+Transactions are held briefly until their block callback supplies historical
+block time and block hash. This buffer is bounded and fails the datasource
+closed if the configured limit is exhausted. Downstream sends are awaited, so
+Carbon pipeline backpressure remains authoritative.
+
+`JetstreamerDatasource::with_sequential_mode` selects Jetstreamer's ordered
+range downloader. The datasource forwards Carbon cancellation to the firehose
+shutdown signal and only returns success after the requested half-open slot
+range completes.

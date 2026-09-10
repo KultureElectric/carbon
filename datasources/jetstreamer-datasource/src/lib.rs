@@ -21,7 +21,7 @@ use {
         collections::{HashMap, HashSet},
         sync::Arc,
     },
-    tokio::sync::Mutex,
+    tokio::sync::{broadcast, Mutex},
     tokio_util::sync::CancellationToken,
 };
 
@@ -71,7 +71,45 @@ static TRANSACTIONS_SENT_WITHOUT_BLOCK_TIME: Counter = Counter::new(
 );
 
 type PendingTransactionKey = (usize, u64);
-type PendingTransactions = Arc<Mutex<HashMap<PendingTransactionKey, Vec<TransactionUpdate>>>>;
+type PendingTransactions = Arc<Mutex<PendingTransactionBuffer>>;
+
+struct PendingTransactionBuffer {
+    by_slot: HashMap<PendingTransactionKey, Vec<TransactionUpdate>>,
+    len: usize,
+    max_len: usize,
+}
+
+impl PendingTransactionBuffer {
+    fn new(max_len: usize) -> Self {
+        Self {
+            by_slot: HashMap::new(),
+            len: 0,
+            max_len,
+        }
+    }
+
+    fn push(
+        &mut self,
+        key: PendingTransactionKey,
+        transaction: TransactionUpdate,
+    ) -> Result<(), std::io::Error> {
+        if self.len >= self.max_len {
+            return Err(std::io::Error::other(format!(
+                "Jetstreamer metadata buffer reached its {} transaction limit",
+                self.max_len
+            )));
+        }
+        self.by_slot.entry(key).or_default().push(transaction);
+        self.len += 1;
+        Ok(())
+    }
+
+    fn remove(&mut self, key: &PendingTransactionKey) -> Vec<TransactionUpdate> {
+        let transactions = self.by_slot.remove(key).unwrap_or_default();
+        self.len = self.len.saturating_sub(transactions.len());
+        transactions
+    }
+}
 
 fn register_jetstreamer_metrics() {
     let registry = MetricsRegistry::global();
@@ -126,6 +164,14 @@ pub struct JetstreamerDatasource {
     pub tracking_interval_slots: Option<u64>,
     pub archive_url: Option<String>,
     pub network: Option<String>,
+    /// Stream epochs in order with one firehose worker and parallel ranged downloads.
+    pub sequential: bool,
+    /// Process epochs newest-first. Jetstreamer implicitly enables sequential mode.
+    pub reverse: bool,
+    /// Maximum hot/cold download window used in sequential mode.
+    pub buffer_window_bytes: Option<u64>,
+    /// Maximum transactions waiting for their block-time and block-hash metadata.
+    pub pending_transaction_limit: usize,
 }
 
 impl JetstreamerDatasource {
@@ -144,6 +190,10 @@ impl JetstreamerDatasource {
             tracking_interval_slots,
             archive_url,
             network,
+            sequential: false,
+            reverse: false,
+            buffer_window_bytes: None,
+            pending_transaction_limit: 100_000,
         }
     }
 
@@ -155,6 +205,18 @@ impl JetstreamerDatasource {
     ) -> Self {
         Self::new(range, filter, threads, tracking_interval_slots, None, None)
     }
+
+    pub fn with_sequential_mode(mut self, reverse: bool, buffer_window_bytes: Option<u64>) -> Self {
+        self.sequential = true;
+        self.reverse = reverse;
+        self.buffer_window_bytes = buffer_window_bytes;
+        self
+    }
+
+    pub fn with_pending_transaction_limit(mut self, limit: usize) -> Self {
+        self.pending_transaction_limit = limit;
+        self
+    }
 }
 
 #[async_trait]
@@ -163,15 +225,23 @@ impl Datasource for JetstreamerDatasource {
         &self,
         id: DatasourceId,
         sender: tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
-        _cancellation_token: CancellationToken,
+        cancellation_token: CancellationToken,
     ) -> CarbonResult<()> {
         register_jetstreamer_metrics();
         reset_jetstreamer_internal_stats();
 
+        if self.pending_transaction_limit == 0 {
+            return Err(carbon_core::error::Error::FailedToConsumeDatasource(
+                "Jetstreamer pending transaction limit must be positive".to_owned(),
+            ));
+        }
+
         let (start_slot, end_slot) = self.range.into_slots();
         let (include_transactions, include_blocks) =
             (self.filter.include_transactions, self.filter.include_blocks);
-        let pending_transactions: PendingTransactions = Arc::new(Mutex::new(HashMap::new()));
+        let pending_transactions: PendingTransactions = Arc::new(Mutex::new(
+            PendingTransactionBuffer::new(self.pending_transaction_limit),
+        ));
 
         if let Some(archive_url) = &self.archive_url {
             unsafe { std::env::set_var("JETSTREAMER_COMPACT_INDEX_BASE_URL", archive_url) }
@@ -230,8 +300,17 @@ impl Datasource for JetstreamerDatasource {
                 tracking_interval_slots: interval_slots,
             });
 
+        let (shutdown_sender, shutdown_receiver) = broadcast::channel(1);
+        let cancellation_task = tokio::spawn(async move {
+            cancellation_token.cancelled().await;
+            let _ = shutdown_sender.send(());
+        });
+
         let result = jetstreamer_firehose::firehose::firehose(
             self.threads,
+            self.sequential,
+            self.reverse,
+            self.buffer_window_bytes,
             start_slot..end_slot,
             if should_request_blocks(include_transactions, include_blocks) {
                 Some(on_block_fn)
@@ -247,9 +326,10 @@ impl Datasource for JetstreamerDatasource {
             None::<HandlerFn<RewardsData>>,
             None::<OnErrorFn>,
             stats_tracking,
-            None,
+            Some(shutdown_receiver),
         )
         .await;
+        cancellation_task.abort();
 
         match result {
             Ok(()) => {
@@ -286,7 +366,7 @@ impl Datasource for JetstreamerDatasource {
 }
 
 impl JetstreamerDatasource {
-    pub async fn on_block(
+    async fn on_block(
         thread_id: usize,
         block: BlockData,
         id: DatasourceId,
@@ -341,7 +421,13 @@ impl JetstreamerDatasource {
                                     lamports: reward.lamports,
                                     post_balance: reward.post_balance,
                                     reward_type: Some(reward.reward_type),
-                                    commission: reward.commission,
+                                    commission: reward
+                                        .commission_bps
+                                        .filter(|basis_points| basis_points % 100 == 0)
+                                        .and_then(|basis_points| {
+                                            u8::try_from(basis_points / 100).ok()
+                                        }),
+                                    commission_bps: reward.commission_bps,
                                 })
                                 .collect::<Vec<_>>(),
                         ),
@@ -359,7 +445,7 @@ impl JetstreamerDatasource {
         Ok(())
     }
 
-    pub async fn on_transaction(
+    async fn on_transaction(
         thread_id: usize,
         transaction: TransactionData,
         transaction_filters: Vec<TransactionFilter>,
@@ -408,12 +494,11 @@ impl JetstreamerDatasource {
             block_hash: None,
         };
 
+        let slot = update.slot;
         pending_transactions
             .lock()
             .await
-            .entry((thread_id, update.slot))
-            .or_default()
-            .push(update);
+            .push((thread_id, slot), update)?;
 
         TRANSACTIONS_BUFFERED_FOR_BLOCK_TIME.inc();
         Ok(())
@@ -432,7 +517,7 @@ impl JetstreamerDatasource {
     {
         let mut transactions = {
             let mut pending_transactions = pending_transactions.lock().await;
-            pending_transactions.remove(&key).unwrap_or_default()
+            pending_transactions.remove(&key)
         };
         let count = transactions.len();
 
@@ -467,7 +552,7 @@ impl JetstreamerDatasource {
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let keys: Vec<PendingTransactionKey> = {
             let pending_transactions = pending_transactions.lock().await;
-            pending_transactions.keys().copied().collect()
+            pending_transactions.by_slot.keys().copied().collect()
         };
         let mut flushed = 0;
 
@@ -491,9 +576,8 @@ impl JetstreamerDatasource {
         INTERNAL_BLOCKS_PROCESSED.set(stats.blocks_processed as f64);
         INTERNAL_TRANSACTIONS_PROCESSED.set(stats.transactions_processed as f64);
         let previous_high_watermark = INTERNAL_SLOT_HIGH_WATERMARK.get().max(0.0) as u64;
-        INTERNAL_SLOT_HIGH_WATERMARK.set(
-            previous_high_watermark.max(stats.thread_stats.current_slot) as f64,
-        );
+        INTERNAL_SLOT_HIGH_WATERMARK
+            .set(previous_high_watermark.max(stats.thread_stats.current_slot) as f64);
         Ok(())
     }
 }
@@ -503,6 +587,7 @@ mod tests {
     use super::*;
     use crate::filter::JetstreamerFilter;
     use crate::range::JetstreamerRange;
+    use solana_message::VersionedMessage;
 
     #[test]
     fn transaction_stream_requests_block_callbacks_for_metadata() {
@@ -543,5 +628,59 @@ mod tests {
             transactions_and_blocks.update_types(),
             vec![UpdateType::Transaction, UpdateType::BlockDetails]
         );
+    }
+
+    fn v1_transaction(slot: u64, transaction_slot_index: usize) -> TransactionData {
+        TransactionData {
+            slot,
+            transaction_slot_index,
+            signature: solana_signature::Signature::default(),
+            message_hash: solana_hash::Hash::default(),
+            is_vote: false,
+            transaction_status_meta: solana_transaction_status::TransactionStatusMeta::default(),
+            transaction: solana_transaction::versioned::VersionedTransaction {
+                signatures: Vec::new(),
+                message: VersionedMessage::V1(solana_message::v1::Message::default()),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_transaction_is_buffered_with_global_index() {
+        let pending = Arc::new(Mutex::new(PendingTransactionBuffer::new(2)));
+        JetstreamerDatasource::on_transaction(
+            3,
+            v1_transaction(42, 7),
+            Vec::new(),
+            pending.clone(),
+        )
+        .await
+        .unwrap();
+
+        let pending = pending.lock().await;
+        let update = &pending.by_slot[&(3, 42)][0];
+        assert_eq!(update.index, Some(7));
+        assert!(matches!(
+            update.transaction.message,
+            VersionedMessage::V1(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn metadata_buffer_fails_closed_at_configured_limit() {
+        let pending = Arc::new(Mutex::new(PendingTransactionBuffer::new(1)));
+        JetstreamerDatasource::on_transaction(
+            0,
+            v1_transaction(42, 0),
+            Vec::new(),
+            pending.clone(),
+        )
+        .await
+        .unwrap();
+        let error =
+            JetstreamerDatasource::on_transaction(0, v1_transaction(43, 1), Vec::new(), pending)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("1 transaction limit"));
     }
 }
