@@ -167,6 +167,8 @@ pub struct Pipeline {
     pub datasource_cancellation_token: Option<CancellationToken>,
     pub shutdown_strategy: ShutdownStrategy,
     pub channel_buffer_size: usize,
+    /// Return the first datasource or processor error to the caller.
+    pub fail_on_error: bool,
 }
 
 impl Pipeline {
@@ -190,6 +192,7 @@ impl Pipeline {
         }
         let (update_sender, mut update_receiver) =
             tokio::sync::mpsc::channel::<(Update, DatasourceId)>(self.channel_buffer_size);
+        let (failure_sender, mut failure_receiver) = tokio::sync::mpsc::unbounded_channel();
 
         let datasource_cancellation_token = self
             .datasource_cancellation_token
@@ -201,6 +204,7 @@ impl Pipeline {
             let sender_clone = update_sender.clone();
             let datasource_clone = Arc::clone(&datasource.1);
             let datasource_id = datasource.0.clone();
+            let failure_sender = failure_sender.clone();
 
             tokio::spawn(async move {
                 if let Err(e) = datasource_clone
@@ -212,14 +216,24 @@ impl Pipeline {
                     .await
                 {
                     log::error!("error consuming datasource: {e:?}");
+                    let _ = failure_sender.send(e);
                 }
             });
         }
 
         drop(update_sender);
+        drop(failure_sender);
 
         loop {
             tokio::select! {
+                failure = failure_receiver.recv(), if self.fail_on_error => {
+                    if let Some(error) = failure {
+                        datasource_cancellation_token.cancel();
+                        self.export_metrics()?;
+                        self.shutdown_exporters()?;
+                        return Err(error);
+                    }
+                }
                 _ = datasource_cancellation_token.cancelled() => {
                     self.export_metrics()?;
                     self.shutdown_exporters()?;
@@ -257,6 +271,12 @@ impl Pipeline {
                                 Err(error) => {
                                     log::error!("error processing update ({update:?}): {error:?}");
                                     UPDATES_FAILED.inc();
+                                    if self.fail_on_error {
+                                        datasource_cancellation_token.cancel();
+                                        self.export_metrics()?;
+                                        self.shutdown_exporters()?;
+                                        return Err(error);
+                                    }
                                 }
                             };
 
@@ -264,6 +284,14 @@ impl Pipeline {
                             UPDATES_QUEUED.set(update_receiver.len() as f64);
                         }
                         None => {
+                            if self.fail_on_error {
+                                if let Ok(error) = failure_receiver.try_recv() {
+                                    datasource_cancellation_token.cancel();
+                                    self.export_metrics()?;
+                                    self.shutdown_exporters()?;
+                                    return Err(error);
+                                }
+                            }
                             log::info!("update_receiver closed, shutting down.");
                             self.export_metrics()?;
                             self.shutdown_exporters()?;
@@ -438,6 +466,7 @@ pub struct PipelineBuilder {
     pub datasource_cancellation_token: Option<CancellationToken>,
     pub shutdown_strategy: ShutdownStrategy,
     pub channel_buffer_size: usize,
+    pub fail_on_error: bool,
 }
 
 impl Default for PipelineBuilder {
@@ -453,6 +482,7 @@ impl Default for PipelineBuilder {
             datasource_cancellation_token: None,
             shutdown_strategy: ShutdownStrategy::default(),
             channel_buffer_size: DEFAULT_CHANNEL_BUFFER_SIZE,
+            fail_on_error: false,
         }
     }
 }
@@ -479,6 +509,12 @@ impl PipelineBuilder {
 
     pub fn shutdown_strategy(mut self, shutdown_strategy: ShutdownStrategy) -> Self {
         self.shutdown_strategy = shutdown_strategy;
+        self
+    }
+
+    /// Make a bounded pipeline fail if a datasource or processor fails.
+    pub fn fail_on_error(mut self) -> Self {
+        self.fail_on_error = true;
         self
     }
 
@@ -653,6 +689,107 @@ impl PipelineBuilder {
             datasource_cancellation_token: self.datasource_cancellation_token,
             shutdown_strategy: self.shutdown_strategy,
             channel_buffer_size: self.channel_buffer_size,
+            fail_on_error: self.fail_on_error,
         })
+    }
+}
+
+#[cfg(test)]
+mod fail_on_error_tests {
+    use super::*;
+    use crate::{
+        datasource::UpdateType,
+        error::{CarbonResult, Error},
+    };
+    use async_trait::async_trait;
+
+    struct FailingDatasource;
+
+    struct SendingDatasource;
+
+    struct FailingBlockProcessor;
+
+    #[async_trait]
+    impl Datasource for FailingDatasource {
+        async fn consume(
+            &self,
+            _: DatasourceId,
+            _: tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
+            _: CancellationToken,
+        ) -> CarbonResult<()> {
+            Err(Error::Custom("fixture datasource failure".to_owned()))
+        }
+
+        fn update_types(&self) -> Vec<UpdateType> {
+            Vec::new()
+        }
+    }
+
+    #[async_trait]
+    impl Datasource for SendingDatasource {
+        async fn consume(
+            &self,
+            id: DatasourceId,
+            sender: tokio::sync::mpsc::Sender<(Update, DatasourceId)>,
+            _: CancellationToken,
+        ) -> CarbonResult<()> {
+            sender
+                .send((
+                    Update::BlockDetails(BlockDetails {
+                        slot: 1,
+                        block_hash: None,
+                        previous_block_hash: None,
+                        rewards: None,
+                        num_reward_partitions: None,
+                        block_time: None,
+                        block_height: None,
+                    }),
+                    id,
+                ))
+                .await
+                .map_err(|error| Error::Custom(error.to_string()))
+        }
+
+        fn update_types(&self) -> Vec<UpdateType> {
+            vec![UpdateType::BlockDetails]
+        }
+    }
+
+    impl Processor<BlockDetails> for FailingBlockProcessor {
+        async fn process(&mut self, _: &BlockDetails) -> CarbonResult<()> {
+            Err(Error::Custom("fixture processor failure".to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn fail_on_error_returns_datasource_failure() {
+        let mut pipeline = Pipeline::builder()
+            .datasource(FailingDatasource)
+            .fail_on_error()
+            .build()
+            .unwrap();
+        let error = pipeline.run().await.unwrap_err();
+        assert!(error.to_string().contains("fixture datasource failure"));
+    }
+
+    #[tokio::test]
+    async fn default_pipeline_retains_log_and_continue_behavior() {
+        let mut pipeline = Pipeline::builder()
+            .datasource(FailingDatasource)
+            .build()
+            .unwrap();
+        pipeline.run().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn fail_on_error_returns_processor_failure() {
+        let mut pipeline = Pipeline::builder()
+            .datasource(SendingDatasource)
+            .block_details(FailingBlockProcessor)
+            .fail_on_error()
+            .build()
+            .unwrap();
+        let error = pipeline.run().await.unwrap_err();
+        assert!(error.to_string().contains("fixture processor failure"));
     }
 }
